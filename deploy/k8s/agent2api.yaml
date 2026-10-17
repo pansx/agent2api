@@ -1,0 +1,174 @@
+# Agent2API —— k3s-frps 部署清单
+#
+#   kubectl --context k3s-frps apply -f deploy/k8s/agent2api.yaml
+#
+# 前置：
+#   1. 镜像已推到 ACR（3.0.8-fork.1-f0ae4db 或更新 tag），见文件末尾「构建」。
+#   2. 同 namespace 的 imagePullSecret `acr-pull` 已创建（从 workbuddy2api 复制）。
+#   3. Secret `agent2api-admin` 已创建（见文件末尾「管理员账号」）。
+#
+# 形态与集群内其它网关（wb2api / logicc2api）保持一致：
+#   单副本 Recreate、local-path PVC、NodePort、非 root + 只读根文件系统。
+# 差异：镜像自带健康检查用的是 /health，这里探针同样打它。
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent2api
+  labels:
+    app.kubernetes.io/name: agent2api
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent2api-data
+  namespace: agent2api
+  labels:
+    app.kubernetes.io/name: agent2api
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: local-path
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent2api
+  namespace: agent2api
+  labels:
+    app.kubernetes.io/name: agent2api
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  # RWO 卷 + SQLite：滚动更新会出现两个 Pod 同时开库，用 Recreate
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent2api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent2api
+        app.kubernetes.io/component: gateway
+    spec:
+      # local-path 卷落在节点本地，固定到数据所在节点
+      nodeSelector:
+        kubernetes.io/hostname: pansx-ubuntu
+      imagePullSecrets:
+        - name: acr-pull
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent2api
+          image: crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.0.8-fork.1-f0ae4db
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3065
+              protocol: TCP
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: AGENT2API_HOST
+              value: 0.0.0.0
+            - name: AGENT2API_PROXY_PORT
+              value: "3065"
+            # 全部状态（SQLite 库、配置、日志）都落在这个卷里
+            - name: AGENT2API_PROXY_HOME
+              value: /data
+            - name: AGENT2API_UI_DIR
+              value: /app/ui
+            # k8s 管理镜像版本：关掉面板里的「容器内原地更新」。
+            # 开着它会改写只读根文件系统（必然失败），且版本漂移无法被
+            # Deployment 的 image tag 表达。
+            - name: AGENT2API_SELF_UPDATE
+              value: "0"
+            - name: AGENT2API_CAPTCHA_ENABLED
+              value: "1"
+            # 预置管理员，避免公网面板被「先到先注册」占走
+            - name: AGENT2API_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: agent2api-admin
+                  key: AGENT2API_ADMIN_USER
+            - name: AGENT2API_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agent2api-admin
+                  key: AGENT2API_ADMIN_PASSWORD
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # 凭据导入、数据库备份等会写 std::env::temp_dir()
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: agent2api-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent2api
+  namespace: agent2api
+  labels:
+    app.kubernetes.io/name: agent2api
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: agent2api
+  ports:
+    - name: http
+      port: 3065
+      targetPort: http
+      nodePort: 30665
+      protocol: TCP
