@@ -6,7 +6,7 @@
 | 项 | 值 |
 | --- | --- |
 | 命名空间 | `agent2api` |
-| 镜像 | `crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.0.8-fork.1-f0ae4db` |
+| 镜像 | `crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.1.0` |
 | 端口 | Service 3065 → NodePort 30665 |
 | 数据卷 | `agent2api-data`（2Gi，挂 `/data`） |
 | 调度节点 | `pansx-ubuntu`（局部卷绑节点） |

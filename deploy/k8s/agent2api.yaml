@@ -71,7 +71,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agent2api
-          image: crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.0.8-fork.1-f0ae4db
+          image: crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
