@@ -141,6 +141,7 @@ impl<'a> CooldownKeys<'a> {
         self.for_provider(provider_of(account))
     }
 }
+
 /// 账号对某模型是否处于限额冷却期。
 ///
 /// 对应 Node 版 `isRateLimited(account, model, now)`：只认 `rateLimits[model].resetAt`
@@ -423,7 +424,7 @@ pub fn accounts_of(snapshot: &Value) -> Vec<Value> {
 fn compare_by_priority(a: &Value, b: &Value) -> std::cmp::Ordering {
     let key = |account: &Value| {
         (
-            normalize_priority(account.get("priority"), crate::server::core::account_store::priority::DEFAULT_PRIORITY),
+            normalize_priority(account.get("routingPriority").or_else(|| account.get("priority")), crate::server::core::account_store::priority::DEFAULT_PRIORITY),
             js_number(account.get("addedAt").unwrap_or(&Value::Null)).unwrap_or(0.0),
         )
     };
@@ -1160,3 +1161,5 @@ mod tests {
         assert_eq!(order, vec!["a1", "a2", "b1", "b2"]);
     }
 }
+
+
