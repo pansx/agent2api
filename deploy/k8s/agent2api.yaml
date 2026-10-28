@@ -121,11 +121,13 @@ spec:
               mountPath: /tmp
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 200m
+              memory: 256Mi
             limits:
-              cpu: "1"
-              memory: 512Mi
+              # 512Mi 会被 OOMKilled（3.1.0 起面板/助手/多账号场景常驻更高）：
+              # 大请求体（数 MB 的 /v1/responses）与工具声明展开都在进程内驻留。
+              cpu: "4"
+              memory: 4Gi
           startupProbe:
             httpGet:
               path: /health
