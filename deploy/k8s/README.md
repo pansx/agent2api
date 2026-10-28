@@ -6,7 +6,7 @@
 | 项 | 值 |
 | --- | --- |
 | 命名空间 | `agent2api` |
-| 镜像 | `crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.1.0` |
+| 镜像 | `crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.3.0-beta.4` |
 | 端口 | Service 3065 → NodePort 30665 |
 | 数据卷 | `agent2api-data`（2Gi，挂 `/data`） |
 | 调度节点 | `pansx-ubuntu`（局部卷绑节点） |
@@ -61,6 +61,17 @@ Pod 同时开库。
 安全上下文：`runAsUser/Group/fsGroup=10001`、`readOnlyRootFilesystem=true`、
 丢弃全部 capabilities、`seccompProfile=RuntimeDefault`；`/tmp` 用 emptyDir
 （凭据导入、数据库备份会写临时目录）。
+
+## 3.3 起：提供商实现改走插件
+
+3.3.0 起网关本体不内置任何「怎么打上游」的实现，转发 / 账号解析全在提供商
+插件里（官方包 `agent2api-providers`，索引 `Agent2plugin/Agent2plugin`）。
+首次启动会从 GitHub 自动下载官方插件到 `/data/plugins` 并拉起宿主进程 ——
+Pod 必须能出网访问 `raw.githubusercontent.com` 与 `api.github.com`（本集群
+实测 200）。插件缺失时 `/v1/*` 一律 503「需要安装插件」，但网关本身照常存活。
+
+`SELF_UPDATE=0` 只关面板内的程序自更新，不影响插件下载与更新；插件随 PVC
+持久化，Pod 重建不会丢。
 
 ## 排查
 
