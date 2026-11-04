@@ -6,7 +6,7 @@
 | 项 | 值 |
 | --- | --- |
 | 命名空间 | `agent2api` |
-| 镜像 | `crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.3.0-beta.4` |
+| 镜像 | `crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.4.0` |
 | 端口 | Service 3065 → NodePort 30665 |
 | 数据卷 | `agent2api-data`（2Gi，挂 `/data`） |
 | 调度节点 | `pansx-ubuntu`（局部卷绑节点） |
@@ -72,6 +72,24 @@ Pod 必须能出网访问 `raw.githubusercontent.com` 与 `api.github.com`（本
 
 `SELF_UPDATE=0` 只关面板内的程序自更新，不影响插件下载与更新；插件随 PVC
 持久化，Pod 重建不会丢。
+
+每日签到 / 新手福利 / 活动套餐各张卡有没有账号，取决于插件申报的
+`CheckinInfo`（`daily` / `onboarding` / `plans` / `growth`）——网关不判断
+「这家能不能签」，只按申报分派。3.4.0 这一版插件申报后，本集群落在每日签到
+范围内的是 37 个账号（30 个 3.3.x 时代的老几家里再加 ZCode 7 个）。
+
+## 3.4 起：模型调用必须带网关 Key
+
+`POST /v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/images/*`
+这类模型调用现在一律要求 `Authorization: Bearer <网关 Key>`，且 Key 必须是
+「已创建且启用」的，否则直接 401：
+
+```json
+{"error":{"code":"model_api_key_required","message":"模型调用必须选择并携带 API Key，请先在「网关 Key」页创建并启用一把 Key","type":"authentication_error"}}
+```
+
+`GET /v1/models` 是元数据接口，仍然匿名可读。升级后要确认所有客户端都配了
+Key；本集群当前有 3 把启用的 Key（`local` / `gongYi` / `hermes`）。
 
 ## 排查
 
