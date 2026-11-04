@@ -170,7 +170,7 @@ Linux 寫在 `/etc/agent2api/agent2api.env`；Windows 改服務登錄檔的
 
 ## Docker
 
-映像標籤：`latest` 跟隨最新正式版，`beta` 跟隨最新 beta 預發布版；也可使用完整版本號（例如 `3.3.0-beta.3`）固定版本。要使用 beta，將下方命令或 Compose 設定中的 `aimodcc/agent2api:latest` 改為 `aimodcc/agent2api:beta`；更新時執行 `docker compose pull && docker compose up -d`。beta 發布不會改動 `latest`，手動開發建置只更新 `dev`。
+映像標籤：`latest` 跟隨最新正式版，`beta` 跟隨最新 beta 預發布版；也可使用完整版本號（例如 `3.3.0-beta.3`）固定版本。要使用 beta，將下方命令或 Compose 設定中的 `aimodcc/agent2api:latest` 改為 `aimodcc/agent2api:beta`；更新時執行 `docker compose pull && docker compose up -d`。beta 發布不會改動 `latest`，手動開發建置只更新 `dev`。同一份映像也同步發布在 GitHub Container Registry：把映像名稱換成 `ghcr.io/aimod-cc/agent2api` 即可，標籤規則完全相同。
 
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
@@ -204,9 +204,30 @@ services:
 | `AGENT2API_ALLOW_NO_KEY` | 設 `1` 關閉 fail-closed（未設 Key 也放行 `/v1`，僅限純內網） |
 | `AGENT2API_CAPTCHA_ENABLED` | 登入頁人機驗證元件：預設 `1` 開啟，`0` 關閉 |
 | `AGENT2API_SELF_UPDATE` | 容器內的更新入口：預設 `1` 開啟（面板可「下載並更新」）；設 `0` 關閉，只走手動升級 |
+| `AGENT2API_IMAGE_CACHE_MB` | 生成圖片的下載記憶體快取上限（MiB，預設 `128`，範圍 8~4096）。寫壞 / 越界回落預設值 |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | 工作階段圖片壓縮結果的記憶體快取上限（MiB，預設 `128`，範圍 8~4096，口徑同上） |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 進階：把「檢查更新 / 下載更新」換成自建源。前者換儲存庫（預設跟上游 `aimod-cc/Agent2API`，fork 後可改），後者換 API 根（預設 `https://api.github.com`，需返回與 GitHub 同形的 release JSON）。配了自建源後，下載白名單只額外放行**該源自己的網域**（按源的 scheme：配 `http://` 就允許明文下載，僅建議本地演練 / 內網映像用） |
 
 從原始碼建置：複製本專案後 `docker compose up -d --build`（映像裡只有閘道與面板，不含 Rust 工具鏈）。
+
+### 記憶體佔用
+
+映像裡的閘道（Linux 目標）已內建 jemalloc 記憶體配置器。長時間執行、多帳號並行轉發時，它比系統內建的配置器更不容易產生記憶體碎片、RSS 也不容易緩慢成長 —— 這正是小記憶體機器最常被拖垮或 OOM 的一環。
+
+小記憶體機器建議給容器設一個記憶體上限：超限時核心會終止行程，再由 `restart: unless-stopped` 拉起，表現為「重啟一次」，而不是把主機（或同機其它服務）拖垮。
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+compose 使用者在服務裡加一行 `mem_limit: 1g`（`docker-compose.yml` 已附註解示例）；swarm 或 `docker compose --compatibility` 用 `deploy.resources.limits.memory`。1g 只是起點，依實際併發量調整。
+
+兩處常駐記憶體的圖片快取上限都能用環境變數調小（預設各 `128` MiB）：`AGENT2API_IMAGE_CACHE_MB`（生成圖片的下載快取）、`AGENT2API_IMAGE_COMPRESS_CACHE_MB`（工作階段圖片壓縮結果快取）。寫壞或越界會回落預設值，不會讓服務起不來。
+
+`MALLOC_ARENA_MAX=2` 這類 glibc 配置器調校，只對**沒有內建 jemalloc 的形態**有意義（舊版映像、自行編譯的伺服器端、桌面端）；本映像已不需要設定它。
 
 **網頁面板的功能差異**（源於「沒有本機桌面客戶端」）：網頁登入（WorkBuddy / Qoder / Cline）、手機驗證碼、貼上憑證完全可用；需要本機回呼的網頁登入（AutoClaw / CatPaw / Accio / CodeArts / Trae）與「匯入本機登入狀態」不可用，請改用貼上憑證。桌面端開著「同時開放網頁管理面板」時，用瀏覽器存取該面板也是這一套差異 —— 同一份介面、同一套判定。
 
@@ -342,7 +363,7 @@ Release 裡的 `Agent2API-<版本>.ipa` **預設是未簽名包** —— 蘋果�
 | 一鍵簽到、看簽到記錄 | 逐項領取新手福利與套餐 |
 | 啟停模型、按提供商篩選 | 改模型對應、思考等級、能力位 |
 | 複製閘道 Key、啟停 Key | 新建 Key、設定可用範圍白名單 |
-| 啟停代理、測試連通性 | 新增代理、訂閱管理、核心下載 |
+| 新增、編輯、刪除手動 HTTP / SOCKS5 代理，同步 Clash Verge 端點，啟停與測試連通性 | —（代理訂閱與內建核心已下線） |
 | 啟停定時任務、改間隔 | 改連接埠、路由、重試、逾時、資料保留 |
 | 助手快捷查詢（餘額 / 重複模型 / 今日用量 / 限流帳號） | 助手的自由對話與工具呼叫 |
 | 檢視 Agent 接管狀態、還原 | 改寫用戶端設定（手機讀不到本機檔案） |

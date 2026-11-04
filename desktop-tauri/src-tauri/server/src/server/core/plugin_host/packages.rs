@@ -1,12 +1,14 @@
 //! 包在停止旧宿主之前完成解包与验签；登记失败时恢复同版本重装的原目录。
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent2api_provider_protocol as proto;
 
 use super::install::{self, InstalledPack, PackRegistry, PackSummary, SignatureState};
+
+// 安装与下载共用有限的 ZIP 硬上限；解压总量与文件数仍由 install 独立限制。
+pub(crate) const MAX_PACK_BYTES: usize = 24 * 1024 * 1024;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -59,8 +61,11 @@ pub fn prepare(
     expected_version: Option<&str>,
     require_signed: bool,
 ) -> Result<PreparedPack, String> {
-    if bytes.is_empty() || bytes.len() > 24 * 1024 * 1024 {
-        return Err("插件包必须为非空且不超过 24 MB 的 zip".to_string());
+    if bytes.is_empty() || bytes.len() > MAX_PACK_BYTES {
+        return Err(format!(
+            "插件包必须为非空且不超过 {} MiB 的 zip",
+            MAX_PACK_BYTES / (1024 * 1024)
+        ));
     }
     let staging = install::plugins_dir().join(".staging").join(format!(
         "pack-{}-{}-{}",
@@ -73,6 +78,9 @@ pub fn prepare(
         install::extract_zip(bytes, &staging)?;
         let manifest = install::read_manifest(&staging)?;
         install::validate_manifest(&manifest, proto::PROTOCOL_VERSION)?;
+        if let Some(reason) = super::compatibility::version_error(&manifest.id, &manifest.version) {
+            return Err(reason);
+        }
         if manifest.id.is_empty()
             || !manifest
                 .id
@@ -128,13 +136,38 @@ pub fn prepare(
 }
 
 impl PreparedPack {
+    pub fn id(&self) -> &str { &self.manifest.id }
+
+    pub(super) fn record(&self, registry: &PackRegistry) -> InstalledPack {
+        let previous = registry.packs.iter().find(|pack| pack.id == self.manifest.id);
+        let providers = self.manifest.providers.iter().map(|provider| {
+            let id = provider.id.0.clone();
+            let enabled = previous.and_then(|pack| pack.providers.get(&id)).copied()
+                .or_else(|| super::ownership::migrated_enabled(registry, &self.manifest.id, &id))
+                .unwrap_or(provider.default_enabled);
+            (id, enabled)
+        }).collect();
+        InstalledPack {
+            id: self.manifest.id.clone(), version: self.manifest.version.clone(),
+            enabled: previous.map(|pack| pack.enabled).unwrap_or(true), providers,
+            entry: self.entry.clone(), sha256: self.sha256.clone(), signed: self.signed,
+            installed_at: crate::server::logging::now_ms(),
+            manifest_providers: self.manifest.providers.clone(),
+        }
+    }
+
     pub fn install(self) -> Result<PackSummary, String> {
+        let transaction = self.install_pending()?;
+        let id = transaction.id.clone();
+        transaction.commit();
+        install::list_packs().into_iter().find(|pack| pack.id == id)
+            .ok_or_else(|| "安装后读不到注册表条目".to_string())
+    }
+
+    pub(super) fn install_pending(self) -> Result<InstalledTransaction, String> {
         let mut registry = PackRegistry::load();
-        let previous = registry
-            .packs
-            .iter()
-            .find(|pack| pack.id == self.manifest.id)
-            .cloned();
+        let previous_registry = registry.clone();
+        let record = self.record(&registry);
         let version_dir = install::plugins_dir()
             .join(&self.manifest.id)
             .join(&self.manifest.version);
@@ -154,61 +187,56 @@ impl PreparedPack {
         }
         if let Err(error) = install::move_dir_retrying(&self.staging, &version_dir) {
             if replaced {
-                let _ = install::move_dir_retrying(&backup, &version_dir);
+                install::move_dir_retrying(&backup, &version_dir).map_err(|restore| {
+                    format!("落盘失败：{error}；恢复旧文件失败：{restore}；备份保留在 {}", backup.display())
+                })?;
             }
             return Err(format!("落盘失败：{error}"));
         }
-        // 更新不能重新启用用户停掉的整包或提供商；新 provider 仍采用其默认值。
-        let providers: BTreeMap<String, bool> = self
-            .manifest
-            .providers
-            .iter()
-            .map(|provider| {
-                let id = provider.id.0.clone();
-                let enabled = previous
-                    .as_ref()
-                    .and_then(|pack| pack.providers.get(&id))
-                    .copied()
-                    .or_else(|| super::ownership::migrated_enabled(&registry, &self.manifest.id, &id))
-                    .unwrap_or(provider.default_enabled);
-                (id, enabled)
-            })
-            .collect();
-        let record = InstalledPack {
-            id: self.manifest.id.clone(),
-            version: self.manifest.version.clone(),
-            enabled: previous.as_ref().map(|pack| pack.enabled).unwrap_or(true),
-            providers,
-            entry: self.entry.clone(),
-            sha256: self.sha256.clone(),
-            signed: self.signed,
-            installed_at: crate::server::logging::now_ms(),
-            manifest_providers: self.manifest.providers.clone(),
-        };
         match registry.packs.iter_mut().find(|pack| pack.id == record.id) {
             Some(slot) => *slot = record,
             None => registry.packs.push(record),
         }
         if let Err(error) = registry.save() {
-            let _ = install::remove_dir_retrying(&version_dir);
+            install::remove_dir_retrying(&version_dir)
+                .map_err(|restore| format!("保存插件登记失败：{error}；移除新文件失败：{restore}；旧备份已保留"))?;
             if replaced {
-                let _ = install::move_dir_retrying(&backup, &version_dir);
+                install::move_dir_retrying(&backup, &version_dir).map_err(|restore| {
+                    format!("保存插件登记失败：{error}；恢复旧文件失败：{restore}；备份保留在 {}", backup.display())
+                })?;
             }
             return Err(error);
         }
-        if replaced {
-            let _ = install::remove_dir_retrying(&backup);
+        Ok(InstalledTransaction {
+            id: self.manifest.id.clone(), previous_registry, version_dir,
+            backup: replaced.then_some(backup),
+        })
+    }
+}
+
+pub(super) struct InstalledTransaction {
+    id: String,
+    previous_registry: PackRegistry,
+    version_dir: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+impl InstalledTransaction {
+    pub fn commit(self) {
+        if let Some(backup) = self.backup {
+            if let Err(error) = install::remove_dir_retrying(&backup) {
+                crate::server::logging::log("[Plugin]", &format!("插件更新成功，但临时备份清理失败：{error}"));
+            }
         }
-        crate::server::logging::log(
-            "[Plugin]",
-            &format!(
-                "插件「{}」v{} 已安装",
-                self.manifest.name, self.manifest.version
-            ),
-        );
-        install::list_packs()
-            .into_iter()
-            .find(|pack| pack.id == self.manifest.id)
-            .ok_or_else(|| "安装后读不到注册表条目".to_string())
+    }
+
+    pub fn rollback(self) -> Result<(), String> {
+        install::remove_dir_retrying(&self.version_dir)
+            .map_err(|error| format!("移除未能启动的插件文件失败，旧版本备份已保留：{error}"))?;
+        if let Some(backup) = self.backup {
+            install::move_dir_retrying(&backup, &self.version_dir)
+                .map_err(|error| format!("恢复插件文件失败，旧版本备份已保留：{error}"))?;
+        }
+        self.previous_registry.save().map_err(|error| format!("恢复插件登记失败：{error}"))
     }
 }

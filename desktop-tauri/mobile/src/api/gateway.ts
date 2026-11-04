@@ -10,6 +10,7 @@ import { apiCall } from './client'
 import type { ProxyUsage } from '../../../ui-shared/proxy-usage'
 import type { CheckinCenter } from '../../../ui-shared/checkin'
 import type { HiddenAccountsSummary } from '../../../ui-shared/plugins'
+import type { AccountSorting } from '../../../ui-shared/account-sorting'
 import { logQueryString, type LogPage, type LogQuery } from '../../../ui-shared/logs'
 
 export type { LogEntry, LogPage } from '../../../ui-shared/logs'
@@ -18,7 +19,7 @@ export type { CheckinAccount, CheckinCenter, ProviderGroup as CheckinProviderRow
 
 /* ─── 会话 / 账号 ─────────────────────────────── */
 
-export type ProviderSummary = { id?: string; label?: string; count?: number }
+export type ProviderSummary = { id?: string; label?: string; count?: number; category?: 'agent' | 'web'; source?: 'builtin' | 'plugin' }
 
 export type RateLimitInfo = {
   status?: number | string
@@ -43,12 +44,20 @@ export type Account = {
   editionLabel?: string
   tokenExpiresAt?: number
   expiresAt?: number
+  hasAccessToken?: boolean
+  accessTokenExpiresAt?: number | null
+  hasRefreshToken?: boolean
+  refreshTokenLongLived?: boolean
+  refreshExpiresAt?: number | null
+  refreshTokenExpiresAt?: number | null
   needsRelogin?: boolean
   needsReloginReason?: string
   /** 智谱清言：这条账号是不是访客（后端只对本家注入；访客没有积分体系，不查余额） */
   isGuest?: boolean
   /** 按模型记的限流记录 */
   rateLimits?: Record<string, RateLimitInfo>
+  upstreamCooldownUntil?: number | null
+  upstreamBlockedReason?: string
   [key: string]: unknown
 }
 
@@ -66,12 +75,13 @@ export type SessionPayload = {
     accounts?: Account[]
     providers?: ProviderSummary[]
     hiddenAccounts?: HiddenAccountsSummary
+    sorting?: AccountSorting
   }
   accountFeatures?: Record<string, unknown>
   lastRequestModel?: string | null
   routedAccountId?: string | null
   defaultModel?: string | null
-  proxies?: { clashAvailable?: boolean; clashError?: string | null; optionCount?: number }
+  proxies?: { optionCount?: number; clashAvailable?: boolean; clashError?: string | null }
   models?: Array<{ id?: string; name?: string; provider?: string; providerLabel?: string }>
 }
 
@@ -84,6 +94,7 @@ export function fetchAccounts(signal?: AbortSignal): Promise<{
   accounts?: Account[]
   providers?: ProviderSummary[]
   hiddenAccounts?: HiddenAccountsSummary
+  sorting?: AccountSorting
   currentAccountId?: string | null
   currentAccountIds?: Record<string, string | null>
 }> {
@@ -197,6 +208,7 @@ export type RequestRow = {
   sensitiveHits?: Array<{ word?: string; count?: number }>
   route?: unknown
   client?: string
+  isTest?: boolean
   apiKeyId?: string; apiKeyName?: string; apiKeySource?: string
 }
 
@@ -267,10 +279,28 @@ export type ManageModel = {
   upstreamStatus?: 'undeployed' | null
   capabilities?: unknown
   reasoningLevels?: unknown
+  reasoningDefaultLevel?: unknown
+  reasoningFixedLevel?: unknown
+  reasoningBindingSupported?: unknown
+  reasoningSource?: unknown
   refreshedAt?: unknown
 }
 
-export type ManageView = { models?: ManageModel[] }
+export type ManageMapping = {
+  alias?: string
+  target?: string
+  provider?: string
+  enabled?: boolean
+  isDefault?: boolean
+  /**
+   * 这条映射**挂不到任何模型行**（目标上游不在清单里 = `dangling`，
+   * `carried: false` 时说明该上游已下线 / 改了 ID）。见桌面端
+   * `models-dangling.tsx` 的说明 —— 手机端只在模型页顶部提示 + 清理。
+   */
+  dangling?: boolean
+  carried?: boolean
+}
+export type ManageView = { models?: ManageModel[]; mappings?: ManageMapping[] }
 
 export function fetchManage(signal?: AbortSignal): Promise<ManageView> {
   return apiCall<ManageView>('/api/models/manage', { signal })
@@ -282,6 +312,18 @@ export function setModelEnabled(payload: {
   enabled: boolean
 }): Promise<ManageView> {
   return apiCall<ManageView>('/api/models/state', { method: 'POST', body: payload })
+}
+
+/**
+ * 删除一条映射（三元组定位）。手机端只用于清理「未挂载映射」——
+ * 常规的映射编辑仍在桌面端「模型管理」里做。
+ */
+export function removeModelMapping(payload: {
+  alias: string
+  target: string
+  provider?: string
+}): Promise<ManageView> {
+  return apiCall<ManageView>('/api/models/mappings/remove', { method: 'POST', body: payload })
 }
 
 export function refreshModels(): Promise<unknown> {
@@ -323,41 +365,70 @@ export function deleteKey(id: string): Promise<KeysPayload> {
 /* ─── 网络代理 ─────────────────────────────────── */
 
 export type PoolItem = ProxyUsage & {
-  id?: string
-  name?: string
-  source?: string
-  enabled?: boolean
-  protocol?: string
-  host?: string
-  port?: number
-  address?: string
-  lastTest?: { at?: number; success?: boolean; ip?: string; error?: string } | null
-  /** 孤儿订阅节点：所属订阅已不存在（后端标注） */
-  orphan?: boolean
-  [key: string]: unknown
+  id: string
+  name: string
+  source: string
+  enabled: boolean
+  sourceEnabled?: boolean
+  localDisabled?: boolean
+  listenerUid?: string
+  protocol: string
+  host: string
+  port: number | null
+  username: string
+  password: string
+  resolved?: { protocol?: string; host?: string; port?: number | null; label?: string } | null
+  resolveError?: string | null
+  lastTest?: { at?: number; success?: boolean; ip?: string; error?: string; durationMs?: number } | null
 }
 
-export type PoolPayload = {
-  items?: PoolItem[]
-  clash?: { available?: boolean; error?: string | null; options?: unknown[] }
-  /** 内核装没装：订阅节点没有端口时的首要成因（没内核就没有监听器） */
-  kernelInstalled?: boolean
+export type PoolPayload = { items?: PoolItem[]; clash?: import('../../../ui-shared/clash-proxy').ClashProxySnapshot; changes?: number; syncError?: string | null }
+export type ProxyDraft = Pick<PoolItem, 'name' | 'protocol' | 'host' | 'port' | 'username' | 'password' | 'enabled'>
+export type ProxyTestResult = PoolPayload & {
+  success?: boolean
+  error?: string
+  ip?: string
+  durationMs?: number
+  saveError?: string
 }
+export type ProxySettings = { testUrl?: string; defaults?: { testUrl?: string } }
 
 export function fetchProxyPool(signal?: AbortSignal): Promise<PoolPayload> {
   return apiCall<PoolPayload>('/api/proxies/pool', { signal })
 }
 
-export function syncClashProxies(): Promise<PoolPayload & { changes?: number; syncError?: string | null }> {
+export function syncClashProxies(): Promise<PoolPayload> {
   return apiCall('/api/proxies/pool/sync-clash', { method: 'POST' })
+}
+
+export function saveProxyItem(draft: ProxyDraft, id?: string): Promise<PoolPayload> {
+  return apiCall<PoolPayload>(id ? '/api/proxies/pool/update' : '/api/proxies/pool', {
+    method: 'POST', body: { ...draft, source: 'manual', ...(id ? { id } : {}) },
+  })
+}
+
+export function removeProxyItem(id: string): Promise<PoolPayload> {
+  return apiCall<PoolPayload>('/api/proxies/pool/remove', { method: 'POST', body: { id } })
 }
 
 export function setProxyEnabled(id: string, enabled: boolean): Promise<PoolPayload> {
   return apiCall<PoolPayload>('/api/proxies/pool/enable', { method: 'POST', body: { id, enabled } })
 }
 
-export function testProxy(id: string): Promise<PoolPayload & { ok?: boolean; error?: string; ip?: string }> {
+export function testProxy(id: string): Promise<ProxyTestResult> {
   return apiCall('/api/proxies/pool/test', { method: 'POST', body: { id } })
+}
+
+export function testProxyDraft(draft: ProxyDraft): Promise<ProxyTestResult> {
+  return apiCall('/api/proxies/test', { method: 'POST', body: { proxy: { ...draft, source: 'custom' } } })
+}
+
+export function fetchProxySettings(): Promise<ProxySettings> {
+  return apiCall('/api/proxies/settings')
+}
+
+export function saveProxySettings(testUrl: string): Promise<ProxySettings> {
+  return apiCall('/api/proxies/settings', { method: 'POST', body: { testUrl } })
 }
 
 /* ─── 定时任务 ─────────────────────────────────── */
@@ -400,6 +471,7 @@ export function runScheduledTask(id: string): Promise<unknown> {
 /* ─── Agent 接管 ───────────────────────────────── */
 
 export type AgentClient = {
+  resources?: import('../../../ui-shared/agent-resources').ResourceCapabilities
   id?: string
   name?: string
   resolvedPath?: string
@@ -435,18 +507,10 @@ export function restoreAgentClient(clientId: string, token: string): Promise<unk
 
 /* ─── 账号余额 ─────────────────────────────── */
 
-export type UsageRow = {
-  id?: string
-  name?: string | null
-  /** 后端按家给不同形状；前端只读其中几个通用键，故用 Record */
-  usage?: Record<string, unknown> | null
-  error?: string | null
-  code?: string | number | null
-  /** 这一行的结论时刻（毫秒） */
-  at?: number
-}
+export type UsageRow = import('../../../ui-shared/usage-query-state').UsageQueryRow
 
 export type UsageSnapshot = {
+  sorting?: AccountSorting
   /** 全部行里最新的结论时刻 */
   at?: number
   results?: UsageRow[]
@@ -470,7 +534,7 @@ export function renameAccount(id: string, name: string): Promise<unknown> {
   return apiCall(`/api/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name } })
 }
 
-/** 清除限流标记；不传 model = 清除该账号全部模型 */
+/** 不传 model 时清除账号冷却与全部模型限流标记。 */
 export function clearAccountRateLimits(id: string, model?: string): Promise<unknown> {
   return apiCall(`/api/accounts/${encodeURIComponent(id)}/rate-limits/clear`, {
     method: 'POST',

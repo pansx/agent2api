@@ -12,6 +12,7 @@ import { usePullToRefresh, PullIndicator } from '../components/PullToRefresh'
 import { t } from '../i18n'
 import { MetricGrid, MetricCard } from '@ui'
 import { DateRangeFilter } from '../components/DateRangeFilter'
+import { requestApiKeyLabel, requestClientLabel } from '../../../ui-shared/model-api-key'
 import { dateRangeQuery, readCustomRange, saveCustomRange, validCustomRange, type CustomDates, type DateRange } from '../../../ui-shared/date-range'
 
 /**
@@ -155,7 +156,7 @@ export function RequestsPage() {
       <div className='m-body'>
       {Object.keys(sourceQuery).length ? <div className='m-section text-xs text-muted-foreground'>
         {requestQuery.startDate && requestQuery.endDate ? `${requestQuery.startDate} ～ ${requestQuery.endDate}` : t('全部')}
-        {sourceQuery.client !== undefined ? ` · ${sourceQuery.client || t('未记录客户端')}` : ''}
+        {sourceQuery.client !== undefined ? ` · ${requestClientLabel({ client: sourceQuery.client }, t)}` : ''}
         {sourceQuery.apiKey ? ` · ${t('API Key')} ${sourceQuery.apiKey}` : ''}
         <Button variant='ghost' size='sm' onClick={() => store.push('requests')}>{t('清除筛选')}</Button>
       </div> : null}
@@ -192,10 +193,7 @@ export function RequestsPage() {
 }
 
 function requestKeyName(row: RequestRow): string {
-  if (row.apiKeySource === 'key') return row.apiKeyName || row.apiKeyId || t('未命名')
-  if (row.apiKeySource === 'env') return t('环境变量 Key')
-  if (row.apiKeySource === 'none') return t('免鉴权调用')
-  return t('历史未记录 Key')
+  return requestApiKeyLabel(row, t)
 }
 
 function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void }) {
@@ -203,7 +201,7 @@ function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void })
   const tone = !status ? 'warn' : status >= 200 && status < 400 ? 'ok' : 'bad'
   const note = buildNote(row)
   return (
-    <Button size='default' variant='ghost'
+    <Button size='default' variant='ghost' className='h-auto min-w-0 whitespace-normal [overflow-wrap:anywhere]'
       type='button'
       onClick={onClick}
       style={{
@@ -247,11 +245,11 @@ function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void })
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 11.5, color: 'var(--m-text-3)', minWidth: 0 }}>
         <ProviderLogo id={row.provider} />
-        <span style={{ flex: 'none' }}>{providerLabel(row.provider, row.providerLabel)}</span>
+        <span className='min-w-0 flex-1 truncate'>{providerLabel(row.provider, row.providerLabel)}</span>
         {row.accountName ? (
           <>
-            <span style={{ opacity: 0.45 }}>·</span>
-            <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <span className='shrink-0' style={{ opacity: 0.45 }}>·</span>
+            <span className='min-w-0 flex-1 truncate'>
               {row.accountName}
             </span>
           </>
@@ -271,7 +269,7 @@ function RequestCard({ row, onClick }: { row: RequestRow; onClick: () => void })
       </div>
 
       <div className='mt-1 text-xs text-muted-foreground truncate'>
-        {row.client === 'other' ? t('其它') : row.client || t('未记录客户端')} · {requestKeyName(row)}
+        {requestClientLabel(row, t)} · {requestKeyName(row)}
       </div>
       {note ? (
         <div
@@ -367,7 +365,7 @@ function RequestSheet({ row, onClose }: { row: RequestRow | null; onClose: () =>
               </MetricGrid>
 
               <div className='m-rows'>
-                <div className='m-row'><span className='m-k'>{t('客户端')}</span><span className='m-v'>{row.client || t('未记录客户端')}</span></div>
+                <div className='m-row'><span className='m-k'>{t('客户端')}</span><span className='m-v'>{requestClientLabel(row, t)}</span></div>
                 <div className='m-row'><span className='m-k'>{t('API Key')}</span><span className='m-v'>{requestKeyName(row)}</span></div>
                 <div className='m-row'>
                   <span className='m-k'>{t('模型')}</span>

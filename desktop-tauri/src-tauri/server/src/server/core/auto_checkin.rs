@@ -1,49 +1,12 @@
-//! 定时签到 —— 按定时条目（`core::checkin_schedules`）在各自时刻执行一次签到。
+//! 定时签到 —— 按条目区间为每个账号生成每日随机计划。
 //!
-//! 签到执行体与 /api/accounts/checkin 是同一段（`core::billing::checkin::run_checkin`），
-//! 因此限额跳过、国际版排除、串行防风的规则完全一致，不存在两套行为。
-//! 本模块只负责**什么时候跑、跑哪些**：总开关 + 每条条目自己的时刻与范围，
-//! 条目的存储与 CRUD 在 `core::checkin_schedules`。
-//!
-//! ── 触发方式：轮询 + 当天去重（不是单个定时器）────────────────
-//! Node 版用 `setInterval(tick, 30s)`：单个 setTimeout 在系统休眠、锁屏、时钟被改
-//! 之后会漂移甚至整段错过，而每 30 秒比一次「当前是否已过今天的触发点」，
-//! 唤醒后自然补上。Rust 侧用等价的 `sleep(30s)` 循环，每个 tick 都从**墙上时钟**
-//! （北京时间，见 `core::beijing`）重新判定，因此与 Node 一样具备自愈能力：
-//! libuv 与 tokio 的定时器都基于单调时钟，机器休眠期间都不推进，
-//! 醒来的第一次 tick 会把错过的时点补上 —— 两者在这点上是同一套语义。
-//! 多条目之后每个 tick **逐条**判定（各自到点 + 各自的当天去重），同一时刻
-//! 到点的多条靠 fire 的全局「同时只跑一次」串行：抢不到的那条下个 tick 再试。
-//!
-//! ── 时区口径：固定 UTC+8，不跟机器时区（issue #138）────────────
-//! 「今天是否已触发」与触发时刻都按**北京时间**算（`core::beijing`）：
-//! 签到的自然日是上游的自然日（北京时间零点重置），网关跑在 NAS / Docker /
-//! 海外 VPS 上时跟机器时区走会让定时整体漂移 —— 美西机器上 00:01 的签到
-//! 实际发生在北京时间 15:01，当天额度可能已被更早的调用用掉，面板的
-//! 「今日已签到」也按错误的日期显示。移植自 Node 版（作者在国内，`Local`
-//! 恰好等于 UTC+8）时没有显式钉住这个前提，这里补上。
-//!
-//! ── 补签（有意的行为，别「顺手优化」）────────────────────────
-//! Node 版 `start()` 的条件是**「今天还没签过」**，并不判「时间点是否已过」：
-//! 开着自动签到却在 00:01 时没开机、白天才启动 → 立刻补一次。
-//! 签到的每日额度按自然日重置，用户开着开关却整天没签到才是反直觉的结果；
-//! 上游签到接口幂等，重复调用只返回「已领取」。实测（2026-09-17）在 18:44
-//! 把 enabled 设为 true、time 设为 23:00（未来时点）时，Node 版立即执行了
-//! 一次 reason='启动补签' 的签到 —— 所以这里的条件同样只看日期键。
-//! 多条目之后按条目各补各的：今天没跑过的**启用**条目每条补一次。
-//!
-//! ── 配置读写 ────────────────────────────────────────────────
-//! 状态存在 config.json 的 `autoCheckin` 字段：`enabled` 是总开关，
-//! 条目数组在 `schedules`（读写见 `core::checkin_schedules`）。Node 每次
-//! getState/tick 都重读 config.json；Rust 侧读 `config::current()` 的内存快照
-//! （config.rs 已经全量保留未知字段，写回也走它），于是「别人写进 config.json
-//! 的字段不会被吃掉」这条契约继续成立。差异：Node 会看到用户手工改盘上的
-//! config.json 后的新值，Rust 的内存快照只在启动与写入时刷新 —— 手工改文件
-//! 需要重启（与 config.rs 的既有设计一致）。
+//! 主签到、补签与手动签到共用 `core::billing::checkin`，这里只决定执行时机与范围。
+//! 排程按北京时间计算并持久化；轮询从墙上时钟重新判断，重启或休眠后补跑已到时、
+//! 尚未执行的账号，不提前执行未来安排。执行前落账号尝试标记，避免中途退出后重复主轮。
+//! 各提供商的专属窗口、补签点与活动重试分别计算，配置与 CRUD 在 `core::checkin_schedules`。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, TimeZone};
 use serde_json::{json, Map, Value};
@@ -56,7 +19,11 @@ use crate::server::core::billing::BillingService;
 use crate::server::core::checkin_schedules::{self, Schedule};
 use crate::server::logging;
 
+mod execution;
 mod retry;
+mod scheduler;
+mod state;
+pub mod times;
 
 /// 轮询间隔：30 秒足够精确到分钟，又不会让计时器显得忙（Node 版 TICK_MS）
 pub const TICK_MS: u64 = 30_000;
@@ -121,11 +88,20 @@ pub fn default_time() -> String {
 ///     见 `providers::modelscope::checkin`。两个站点各打各的网页站，令牌不通用
 ///     （打错得 401）。链路依据是 CPA 的 `modelscope-ratelimit` 插件源码，
 ///     2026-10 实测复核。
+///   - **ZCode 国内版 / 国际版**：签到 = **领当天那份赠送套餐**。上游每天下发
+///     一份带日期段的新套餐（`zcode-v3-start-plan-<日期>` 这类），在客户端里
+///     点一下就领，那一动作就是本家的签到；同一期再领回 `1003 already claimed`，
+///     所以「今天领过没」不需要本地记账（见 `providers::zcode::checkin`）。
+///     ⚠️ 窗口是**每天 19:00 开启**（官方公告：19:00 起可领，23:00 至次日 09:00
+///     可用），所以它的生效时刻在 `times::PROVIDER_TIMES` 里钉的是 19:01 ——
+///     跟其它家一起在 00:01 去签只会拿到「窗口没开」。
+///     ⚠️ 领取要阿里云人机验证令牌（由界面 WebView 铸造）：headless 部署拿不到
+///     令牌时这一家回中性未领取（不落账、次日再试），不是失败。
 ///
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
 /// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 17] = [
+pub const CHECKIN_PROVIDERS: [&str; 19] = [
     "workbuddy",
     "workbuddy-intl",
     "raccoon",
@@ -161,6 +137,10 @@ pub const CHECKIN_PROVIDERS: [&str; 17] = [
     // check_in），实测 +100 积分/号/天。幂等靠客户端（idempotencyKey + 上游
     // 的 `claimedToday` 预检），见 `lobsterai::checkin` 的模块头。
     "lobsterai",
+    // ZCode 两地：签到 = 领当天那份赠送套餐（见上面那条说明）。
+    // 两个地区各打各的站点、令牌不通用，因此两个 id 分开登记。
+    "zcode",
+    "zcode-intl",
 ];
 
 /// 缺省的签到提供商集合（全选 = **已知**清单，不是「此刻可用」清单）。
@@ -204,6 +184,17 @@ pub fn checkin_providers() -> Vec<String> {
             list.push(id);
         }
     }
+    for id in raw_object()
+        .get("pluginProvidersSeen")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !list.iter().any(|known| known == id) {
+            list.push(id.to_string());
+        }
+    }
     list
 }
 
@@ -235,14 +226,15 @@ pub fn available_checkin_providers(_store: &AccountStore) -> Vec<String> {
 /// 会让这一家的勾选框再也取消不掉（读完就补回来，界面上表现为「取消勾选没反应」）。
 /// 所以补齐只做一次，靠配置里的版本号记账；版本一旦写上去，用户之后再取消勾选
 /// 就真的生效了。执行点见 `checkin_schedules::extend_providers_once`。
-pub const PROVIDERS_VERSION: i64 = 5;
+pub const PROVIDERS_VERSION: i64 = 6;
 
 /// 「哪一版加入的家」——条目清单的版本低于它 = 这家还没被提供过 ⇒ 补进去。
 /// 版本 1 = 多条目改造上线时的形态（9 家；`qoder-intl` 由 `normalize_providers`
 /// 的存量兼容规则跟着 `qoder` 带上，不在这里重复登记）。
 /// 版本 3 = 智谱清言；版本 4 = ModelScope 的两个站点与 AtomCode；
-/// 版本 5 = LobsterAI（两条 provider PR 各自用了一个号，合起来取并集）。
-const PROVIDERS_ADDED_IN: [(&str, i64); 7] = [
+/// 版本 5 = LobsterAI（两条 provider PR 各自用了一个号，合起来取并集）；
+/// 版本 6 = ZCode 的两个站点（签到 = 领当天赠送套餐）。
+const PROVIDERS_ADDED_IN: [(&str, i64); 9] = [
     ("officeace", 2),
     ("codearts", 2),
     ("chatglm", 3),
@@ -250,6 +242,8 @@ const PROVIDERS_ADDED_IN: [(&str, i64); 7] = [
     ("modelscope-intl", 4),
     ("atomcode", 4),
     ("lobsterai", 5),
+    ("zcode", 6),
+    ("zcode-intl", 6),
 ];
 
 /// 版本 `version` 之后才加入清单的家（按注册顺序）。空数组 = 这一版没有新家，
@@ -342,7 +336,10 @@ pub const CHECKIN_BUSY_STATUS: i32 = 400;
 
 impl AutoCheckinConfigError {
     fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), status_code: 400 }
+        Self {
+            message: message.into(),
+            status_code: 400,
+        }
     }
 }
 
@@ -397,7 +394,9 @@ pub fn normalize_time(value: Option<&Value>) -> Result<String, AutoCheckinConfig
         })
         .and_then(|(head, tail)| Some((head.parse::<u32>().ok()?, tail.parse::<u32>().ok()?)));
     let Some((hour, minute)) = parsed else {
-        return Err(AutoCheckinConfigError::new("时间格式应为 HH:MM（例如 00:01）"));
+        return Err(AutoCheckinConfigError::new(
+            "时间格式应为 HH:MM（例如 00:01）",
+        ));
     };
     if hour > 23 || minute > 59 {
         return Err(AutoCheckinConfigError::new("时间超出范围（00:00 - 23:59）"));
@@ -419,33 +418,6 @@ pub fn today_key() -> String {
     beijing::today_key()
 }
 
-/// 今天的触发时刻（北京时间）；已过则返回 Some，未到返回 None。
-/// 对应 Node 版 dueNow：非法的 time 文本在这里同样表现为 None（Node 是抛异常，
-/// 但调用方一律 catch 后 return，结果一致）。
-fn due_now(time_text: &str, now: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
-    let target = today_at(time_text, now)?;
-    if now >= target {
-        Some(target)
-    } else {
-        None
-    }
-}
-
-/// 「下次执行」的绝对时刻（毫秒时间戳），给界面展示用。
-///
-/// 对应 Node 版 msUntilNext 的语义（目标时刻已过顺延到明天）外加**已触发**
-/// 分支：启动补签会在条目时刻之前就把今天落账（补签只看日期不看时点），
-/// 这时「下次执行」必须是明天 —— 只按时刻算会得到今天的未来时刻，
-/// 界面显示一个其实不会跑的点。time 非法 → None（调度起不来的情形
-/// 不该编一个时间出来）。
-fn next_run_at_ms(time_text: &str, fired_today: bool, now: DateTime<FixedOffset>) -> Option<i64> {
-    let mut target = today_at(time_text, now)?;
-    if fired_today || target <= now {
-        target += chrono::Duration::days(1);
-    }
-    Some(target.timestamp_millis())
-}
-
 /// 今天的 HH:MM 时刻（北京时间）；time 文本非法时 None。
 ///
 /// Node 用 `target.setHours(hour, minute, 0, 0)`（就地改到当天）；
@@ -454,14 +426,20 @@ fn next_run_at_ms(time_text: &str, fired_today: bool, now: DateTime<FixedOffset>
 /// 「DST 当天该时刻不存在」的兜底 —— `single()` 取不到就当 None，
 /// 也就是这台机器上的时钟环境异常到连北京时间的固定偏移都构造不出来。
 fn today_at(time_text: &str, now: DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
+    normalize_today_at(time_text, now)
+}
+
+/// [`today_at`] 的实现本体（`times` 子模块要用同一套构造，见那里的说明）
+pub(crate) fn normalize_today_at(
+    time_text: &str,
+    now: DateTime<FixedOffset>,
+) -> Option<DateTime<FixedOffset>> {
     let normalized = normalize_time(Some(&Value::String(time_text.to_string()))).ok()?;
     let (hour, minute) = normalized.split_once(':')?;
     let hour: u32 = hour.parse().ok()?;
     let minute: u32 = minute.parse().ok()?;
     let naive = now.date_naive().and_hms_opt(hour, minute, 0)?;
-    beijing::offset()
-        .from_local_datetime(&naive)
-        .single()
+    beijing::offset().from_local_datetime(&naive).single()
 }
 
 // ─── 状态读写 ───────────────────────────────────────────────
@@ -486,13 +464,19 @@ pub fn master_enabled() -> bool {
 /// 走 config.rs 的 `update_raw_field`，config.json 里的其它字段原样保留。
 /// `pub(crate)`：多条目配置在同一键下写回，合并逻辑只有这一份。
 pub(crate) fn write_state(patch: Value) {
-    let mut merged = raw_object();
-    if let Value::Object(patch) = patch {
-        for (key, value) in patch {
-            merged.insert(key, value);
+    update_state(|state| {
+        if let Value::Object(patch) = patch {
+            state.extend(patch);
         }
-    }
-    config::update_raw_field(CONFIG_KEY, Value::Object(merged));
+    });
+}
+
+pub(crate) fn update_state(apply: impl FnOnce(&mut Map<String, Value>)) {
+    config::update_raw_field_with(CONFIG_KEY, |value| {
+        let mut state = value.as_object().cloned().unwrap_or_default();
+        apply(&mut state);
+        *value = Value::Object(state);
+    });
 }
 
 // ─── 服务句柄 ───────────────────────────────────────────────
@@ -562,372 +546,6 @@ impl AutoCheckin {
         self.lock().running
     }
 
-    // ─── 对外状态 ───────────────────────────────────────────
-
-    /// 对外暴露的状态（对应 Node 版 getState 的多条目版）。
-    ///
-    /// 形状分两层：
-    ///   - `schedules`：条目视图（每条含自己的 enabled / time / providers /
-    ///     lastFiredToday / nextRunAt / lastResult），签到中心的「定时签到」页直接渲染；
-    ///   - 顶层 `time` / `providers` / `lastFiredDate` / `lastFiredToday` /
-    ///     `lastResult` / `nextRunAt`：**兼容视图**——顶层 nextRunAt 是所有启用
-    ///     条目里最近的一次（顶栏徽标用），其余字段取默认条目（合成的或显式的
-    ///     id="default"；删光了就给缺省值），旧读方（启动日志）不用改。
-    pub fn state(&self) -> Value {
-        let master = master_enabled();
-        let now = beijing::now();
-        let today = date_key(now);
-        let schedules = checkin_schedules::list();
-        let entries: Vec<Value> = schedules
-            .iter()
-            .map(|schedule| {
-                let fired_today = schedule.last_fired_date.as_deref() == Some(today.as_str());
-                let next_run_at = if master && schedule.enabled {
-                    retry::next_at(schedule.last_result.as_ref(), &today)
-                        .or_else(|| next_run_at_ms(&schedule.time, fired_today, now))
-                } else {
-                    None
-                };
-                json!({
-                    "id": schedule.id,
-                    "label": schedule.label,
-                    // 展示名：label 为空时退到 time，界面不必各自兜底
-                    "displayLabel": checkin_schedules::display_label(schedule),
-                    "enabled": schedule.enabled,
-                    "time": schedule.time,
-                    "providers": schedule.providers,
-                    "lastFiredDate": schedule.last_fired_date,
-                    "lastFiredToday": fired_today,
-                    "nextRunAt": next_run_at,
-                    "lastResult": schedule.last_result,
-                })
-            })
-            .collect();
-        // 聚合「下次执行」：启用条目里最近的一次（总开关关着就没了）
-        let next_run_at = if master {
-            entries
-                .iter()
-                .filter_map(|entry| entry.get("nextRunAt").and_then(Value::as_i64))
-                .min()
-        } else {
-            None
-        };
-        // 兼容视图的「默认条目」：显式 default → 第一条 → （删光了）缺省
-        let fallback = Schedule {
-            id: checkin_schedules::DEFAULT_SCHEDULE_ID.to_string(),
-            label: String::new(),
-            enabled: false,
-            time: default_time(),
-            providers: default_providers(),
-            last_fired_date: None,
-            last_result: None,
-        };
-        let default_entry = schedules
-            .iter()
-            .find(|schedule| schedule.id == checkin_schedules::DEFAULT_SCHEDULE_ID)
-            .or_else(|| schedules.first())
-            .unwrap_or(&fallback);
-        json!({
-            "enabled": master,
-            // 兼容字段（默认条目的投影；语义与改造前的顶层字段一致）
-            "time": default_entry.time,
-            "providers": default_entry.providers,
-            "lastFiredDate": default_entry.last_fired_date,
-            "lastFiredToday":
-                default_entry.last_fired_date.as_deref() == Some(today.as_str()),
-            "lastResult": default_entry.last_result,
-            "nextRunAt": next_run_at,
-            // 界面的复选框清单（签到范围），顺序即注册顺序（插件家追加在末尾）。
-            // 用**可用**清单而不是 `checkin_providers()`：没装插件时那 17 家
-            // 全是点了必然失败的勾选框（2026-10 用户反馈）。条目里已存的
-            // 范围不受影响 —— 落盘的是 id 数组，这里只决定「能勾哪些」。
-            "providerOptions": available_checkin_providers(&self.store).iter().map(|id| {
-                json!({ "id": id, "label": provider_label(id) })
-            }).collect::<Vec<_>>(),
-            "schedules": entries,
-            "running": self.is_running(),
-        })
-    }
-
-    // ─── 执行 ───────────────────────────────────────────────
-
-    /// 执行一次签到并记录结果；失败只记日志，不影响下一次调度。
-    ///
-    /// 返回 None 的两种情形（Node 同）：① 已有一次在跑（本次跳过）；
-    /// ② 执行抛错。路由层据此把 ① 翻成「签到正在执行中，请稍候」。
-    ///
-    /// 手动全量（`run_now`，无条目归属）走这里：范围是**全部提供商**——多条目
-    /// 之后批量动作不再有全局「勾选范围」可借，那条范围概念进了每条定时条目。
-    pub async fn fire(&self, reason: &str) -> Option<Value> {
-        self.fire_for(reason, None, "manual").await
-    }
-
-    /// 执行一次签到，可归属到某条定时条目。
-    ///
-    /// `schedule_id` 给 Some：范围用**那条条目自己勾选的提供商**，去重标记落
-    /// 条目级（`checkin_schedules::mark_fired` / `mark_result`）；给 None
-    /// （手动全量）：范围是全部提供商，只落配置级标记。
-    /// `source` 是签到记录台账的触发来源（schedule / manual / startup，
-    /// 见 `core::checkin_records` 的模块头）。
-    pub async fn fire_for(
-        &self,
-        reason: &str,
-        schedule_id: Option<&str>,
-        source: &str,
-    ) -> Option<Value> {
-        // 先抢「执行中」标记；抢不到说明上一次还在跑
-        let guard = {
-            let mut inner = self.lock();
-            if inner.running {
-                drop(inner);
-                logging::verbose("[Checkin]", "上一次签到仍在执行，本次跳过");
-                return None;
-            }
-            inner.running = true;
-            RunningGuard { inner: self.inner.clone() }
-        };
-
-        let today = today_key();
-        let schedule = schedule_id.and_then(|id| checkin_schedules::list()
-            .into_iter().find(|schedule| schedule.id == id));
-        let selected = if matches!(source, "schedule" | "startup") {
-            retry::due_accounts(schedule.as_ref().and_then(|schedule| schedule.last_result.as_ref()), logging::now_ms())
-        } else {
-            None
-        };
-        if selected.as_ref().is_some_and(Vec::is_empty) {
-            drop(guard);
-            return None;
-        }
-        // 先落日期再执行：即便签到中途进程被杀，也不会在重启后反复补签
-        write_state(json!({ "lastFiredDate": today }));
-        if let Some(id) = schedule_id {
-            checkin_schedules::mark_fired(id, Some(&today));
-        }
-        logging::log("[Checkin]", &format!("⏰ 定时签到开始（{reason}）"));
-
-        // 范围：条目轮次用那条自己勾的提供商；手动全量（无条目）= 全部提供商。
-        // 条目可能在执行前被删（罕见）：拿不到就按全量兜，不空跑。
-        let providers = schedule.as_ref().map(|schedule| schedule.providers.clone())
-            .unwrap_or_else(default_providers);
-        let outcome = match checkin::run_checkin_selected(
-            &self.store,
-            &self.billing,
-            providers.as_slice(),
-            None,
-            reason,
-            source,
-            selected.as_deref(),
-        )
-        .await
-        {
-            Ok(result) => {
-                let summary = retry::merge(
-                    &self.store,
-                    self.record_success(&result, &today, reason),
-                    &result,
-                    schedule.as_ref().and_then(|schedule| schedule.last_result.as_ref()),
-                    selected.as_deref(),
-                );
-                write_state(json!({ "lastResult": summary }));
-                if let Some(id) = schedule_id {
-                    checkin_schedules::mark_result(id, Some(summary.clone()));
-                }
-                Some(summary)
-            }
-            Err(error) => {
-                // 失败也写 lastResult（failed 里放错误文案），与 Node 的 catch 分支一致
-                let failure = json!({
-                    "at": logging::now_ms(),
-                    "date": today,
-                    "reason": reason,
-                    "succeeded": 0,
-                    "active": 0,
-                    "total": 0,
-                    "skipped": 0,
-                    "failed": [error.message.clone()],
-                    "failedCount": 1,
-                });
-                write_state(json!({ "lastResult": failure.clone() }));
-                if let Some(id) = schedule_id {
-                    checkin_schedules::mark_result(id, Some(failure));
-                }
-                logging::log("[Checkin]", &format!("❌ 定时签到失败: {}", error.message));
-                None
-            }
-        };
-        drop(guard);
-        outcome
-    }
-
-    /// 成功分支：汇总 + 记录 lastResult + 日志（对应 Node fire 里的 try 主体）
-    fn record_success(&self, result: &Value, today: &str, reason: &str) -> Value {
-        let number = |key: &str| {
-            result
-                .get(key)
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-        };
-        let succeeded = number("succeeded");
-        let active = number("active");
-        let total = number("total");
-        let skipped = number("skipped");
-        // 失败明细：`名字（错误）`，名字缺失时退到 id，再退到「未知账号」
-        let failures: Vec<String> = result
-            .get("results")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(checkin::failure_of)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let summary = json!({
-            "at": logging::now_ms(),
-            "date": today,
-            "reason": reason,
-            "succeeded": succeeded,
-            "active": active,
-            "total": total,
-            "skipped": skipped,
-            // 只留前 5 条：面板展示用，避免 config.json 被长列表撑大（Node 同）
-            "failed": failures.iter().take(5).cloned().collect::<Vec<_>>(),
-            "failedCount": failures.len(),
-        });
-        write_state(json!({ "lastResult": summary }));
-        logging::log(
-            "[Checkin]",
-            &format!(
-                "定时签到完成: {succeeded}/{total} 个账号成功领取{}{}{}",
-                if skipped > 0 { format!("，跳过 {skipped} 个") } else { String::new() },
-                if failures.is_empty() {
-                    String::new()
-                } else {
-                    format!("，失败 {} 个", failures.len())
-                },
-                if active > 0 {
-                    format!("，活跃保活 {active} 个")
-                } else {
-                    String::new()
-                },
-            ),
-        );
-        summary
-    }
-
-    // ─── 调度 ───────────────────────────────────────────────
-
-    /// 到点执行整轮；中性未领取只按插件给出的时刻重试对应账号，失败不反复打上游。
-    pub async fn tick(&self) {
-        if !master_enabled() {
-            return;
-        }
-        let now = beijing::now();
-        let today = date_key(now);
-        for schedule in checkin_schedules::list() {
-            // 条目自己的开关（总开关已在上面拦掉）
-            if !schedule.enabled {
-                continue;
-            }
-            let retry_due = retry::due_accounts(schedule.last_result.as_ref(), logging::now_ms());
-            if let Some(accounts) = &retry_due {
-                if accounts.is_empty() { continue; }
-            } else if due_now(&schedule.time, now).is_none()
-                || schedule.last_fired_date.as_deref() == Some(today.as_str()) {
-                continue;
-            }
-            let reason = format!("到点触发（{}）", checkin_schedules::display_label(&schedule));
-            self.fire_for(&reason, Some(&schedule.id), "schedule").await;
-        }
-    }
-
-    /// 起调度循环（对应 Node 版 schedule 的 `if (timer) return`）：
-    /// 已有存活任务就不重复起，避免 configure 每次保存都叠一个循环。
-    fn schedule(&self) {
-        {
-            let mut inner = self.lock();
-            if let Some(task) = &inner.task {
-                if !task.is_finished() {
-                    return;
-                }
-            }
-            inner.stopped = Arc::new(AtomicBool::new(false));
-            let stopped = inner.stopped.clone();
-            let service = self.clone();
-            // 用 crate::spawn_task：本函数可能从 setup 钩子（主线程）或 axum handler
-            // 调用，`crate::spawn_task` 兜底进全局运行时，
-            // 不会像裸 `tokio::spawn` 那样在非运行时上下文 panic（release 是 panic=abort）
-            inner.task = Some(crate::spawn_task(async move {
-                loop {
-                    // 先睡再 tick：与 setInterval 的「间隔后首次触发」一致，
-                    // 也避开 start() 里那次补签刚发起的窗口
-                    tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
-                    if stopped.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    service.tick().await;
-                }
-            }));
-        }
-    }
-
-    /// 启动调度（对应 Node 版 start 的多条目版）。
-    ///
-    /// 开启状态下立即检查一次：**只看「今天签过没有」，不看时点是否已过**
-    /// （理由见模块头部「补签」）。多条目之后按条目各补各的：今天没跑过的
-    /// **启用**条目每条补一次，串在一个任务里跑（fire 的全局防重本来就只允许
-    /// 一轮在跑，串行省得互相抢空）。
-    pub fn start(&self) {
-        if !master_enabled() {
-            return;
-        }
-        self.schedule();
-        let today = today_key();
-        let pending: Vec<Schedule> = checkin_schedules::list()
-            .into_iter()
-            .filter(|schedule| {
-                schedule.enabled && match retry::due_accounts(schedule.last_result.as_ref(), logging::now_ms()) {
-                    Some(accounts) => !accounts.is_empty(),
-                    None => schedule.last_fired_date.as_deref() != Some(today.as_str()),
-                }
-            })
-            .collect();
-        if pending.is_empty() {
-            logging::verbose("[Checkin]", "定时签到条目均已执行，无需补签");
-            return;
-        }
-        let service = self.clone();
-        crate::spawn_task(async move {
-            for schedule in pending {
-                let reason = format!(
-                    "启动补签（{}）",
-                    checkin_schedules::display_label(&schedule)
-                );
-                service.fire_for(&reason, Some(&schedule.id), "startup").await;
-            }
-        });
-    }
-
-    /// 停调度（进程退出时用）。幂等：重复调用不会报错。
-    ///
-    /// 与 Node 的 `clearInterval` 语义对齐：只结束**循环**，不打断正在跑的
-    /// 那一次签到（abort 只会让任务在下一个 await 点结束，config.json 的写入是
-    /// 同步的，已落盘的 lastFiredDate 不会被回滚）。
-    pub fn stop(&self) {
-        let task = {
-            let mut inner = self.lock();
-            if inner.task.is_none() {
-                return;
-            }
-            inner.stopped.store(true, Ordering::SeqCst);
-            inner.task.take()
-        };
-        if let Some(task) = task {
-            task.abort();
-        }
-    }
-
     // ─── 设置 ───────────────────────────────────────────────
 
     /// 保存设置（对应 Node 版 configure 的兼容入口）。
@@ -944,7 +562,13 @@ impl AutoCheckin {
         let has_enabled = payload.get("enabled").is_some();
         let has_time = payload.get("time").is_some();
         let has_providers = payload.get("providers").is_some();
-        if !has_enabled && !has_time && !has_providers {
+        // 逐家时刻 / 补签时刻也走这条兼容入口（老界面只传前三个，新界面可以全传）
+        let has_times = payload.get("timeEnd").is_some()
+            || payload.get("providerTimes").is_some()
+            || payload.get("retryTime").is_some()
+            || payload.get("retryGapMinutes").is_some()
+            || payload.get("retryLimit").is_some();
+        if !has_enabled && !has_time && !has_providers && !has_times {
             return Err(AutoCheckinConfigError::new("没有需要更新的字段"));
         }
         if has_enabled {
@@ -957,7 +581,7 @@ impl AutoCheckin {
                 &format!("定时签到总开关已{}", if on { "开启" } else { "关闭" }),
             );
         }
-        if has_time || has_providers {
+        if has_time || has_providers || has_times {
             let mut entry = Map::new();
             entry.insert(
                 "id".to_string(),
@@ -993,12 +617,43 @@ impl AutoCheckin {
                 }
                 entry.insert("providers".to_string(), Value::Array(picked));
             }
+            for key in [
+                "timeEnd",
+                "providerTimes",
+                "retryTime",
+                "retryGapMinutes",
+                "retryLimit",
+            ] {
+                if let Some(value) = payload.get(key) {
+                    entry.insert(key.to_string(), value.clone());
+                }
+            }
+            let existing = checkin_schedules::list()
+                .into_iter()
+                .find(|schedule| schedule.id == checkin_schedules::DEFAULT_SCHEDULE_ID);
+            entry.entry("time".to_string()).or_insert_with(|| {
+                Value::from(
+                    existing
+                        .as_ref()
+                        .map(|schedule| schedule.time.clone())
+                        .unwrap_or_else(default_time),
+                )
+            });
+            entry.entry("providers".to_string()).or_insert_with(|| {
+                json!(existing
+                    .as_ref()
+                    .map(|schedule| schedule.providers.clone())
+                    .unwrap_or_else(default_providers))
+            });
+            entry.insert(
+                "label".to_string(),
+                Value::from(existing.map(|schedule| schedule.label).unwrap_or_default()),
+            );
             // 不带 enabled：条目自己的开关保持原样（这里只改时刻/范围）
             checkin_schedules::upsert(&Value::Object(entry))
                 .map_err(|error| AutoCheckinConfigError::new(error))?;
         }
-        // 总开关开着就走一遍 start()：确保调度循环在跑（幂等），并且刚开启 /
-        // 刚改完配置的今天还没跑过的条目立刻补签（模块头「补签」的实测行为）
+        // 保证调度循环运行，并检查已到时的未执行账号；未来安排仍等待各自时刻。
         if master_enabled() {
             self.start();
         }
@@ -1026,8 +681,13 @@ impl AutoCheckin {
     /// 或总开关开着 —— 用户点了就是明确要跑这一条。条目不存在返回 None 与
     /// 「在跑」不可区分，路由层先查存在性（见 api::checkin_schedules）。
     pub async fn run_schedule_now(&self, id: &str) -> Option<Value> {
-        let schedule = checkin_schedules::list().into_iter().find(|entry| entry.id == id)?;
-        let reason = format!("手动触发（{}）", checkin_schedules::display_label(&schedule));
+        let schedule = checkin_schedules::list()
+            .into_iter()
+            .find(|entry| entry.id == id)?;
+        let reason = format!(
+            "手动触发（{}）",
+            checkin_schedules::display_label(&schedule)
+        );
         self.fire_for(&reason, Some(id), "manual").await
     }
 }

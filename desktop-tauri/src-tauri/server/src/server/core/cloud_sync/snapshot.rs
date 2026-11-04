@@ -68,6 +68,7 @@ const EXCLUDED_CONFIG_KEYS: &[&str] = &[
     "githubToken",
     // 代理内核的下载出网线路：绑本机网络环境
     "kernelProxy",
+    crate::server::config::KEY_INSTALLED_UPDATE_VERSION,
 ];
 
 /// 保留键里**进快照**的项（其余保留键一律不进）。
@@ -295,8 +296,15 @@ pub(crate) fn apply(db: &Db, snapshot: &Snapshot) -> Result<Value, String> {
         ));
     }
 
-    db.with_mut(|conn| apply_conn(conn, snapshot))
-        .ok_or_else(|| "数据库连接不可用，无法应用同步快照".to_string())?
+    let applied = db.with_mut(|conn| {
+        db.invalidate_accounts();
+        let applied = apply_conn(conn, snapshot);
+        db.invalidate_accounts();
+        applied
+    })
+        .ok_or_else(|| "数据库连接不可用，无法应用同步快照".to_string())?;
+    db.invalidate_accounts();
+    applied
 }
 
 fn apply_conn(conn: &mut Connection, snapshot: &Snapshot) -> Result<Value, String> {

@@ -117,7 +117,9 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
     }
     item.insert("input_modalities".to_string(), Value::Array(modalities));
     let image_generation = crate::server::core::providers::images::model_is_image(model);
-    item.insert("supports_image_generation".to_string(), Value::Bool(image_generation));
+    item.insert("supports_image_generation".to_string(), Value::Bool(
+        crate::server::core::providers::images::provider_model_supports_generation(provider_id, model),
+    ));
     item.insert("supports_image_editing".to_string(), Value::Bool(
         crate::server::core::providers::images::provider_model_supports_editing(provider_id, model),
     ));
@@ -138,6 +140,17 @@ pub fn list_item(model: &Value, provider_id: &str) -> Value {
             _ => Value::String("chat".to_string()),
         },
     );
+    for (source, target) in [
+        ("reasoningLevels", "reasoning_efforts"),
+        ("reasoningDefaultLevel", "reasoning_default_effort"),
+        ("reasoningFixedLevel", "reasoning_fixed_effort"),
+        ("reasoningBindingSupported", "reasoning_binding_supported"),
+        ("reasoningSource", "reasoning_source"),
+    ] {
+        if let Some(value) = model.get(source).filter(|value| !value.is_null()) {
+            item.insert(target.to_string(), value.clone());
+        }
+    }
     if let Some(status) = model.get("upstreamStatus").filter(|value| value.is_string()) {
         item.insert("upstream_status".to_string(), status.clone());
     }

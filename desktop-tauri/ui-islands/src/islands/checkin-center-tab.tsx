@@ -10,8 +10,10 @@ import {
   type PlanEntry, type ProviderGroup,
 } from './checkin-types'
 import { CheckinRow, ProviderLogo } from './checkin-row'
+import { CheckinUmid } from './checkin-umid'
 import { claimOnboarding, onboardingOf, queryOnboarding } from './checkin-onboarding'
 import { t } from '../i18n'
+import { growthTaskCompleted, growthTaskRunnable } from '../../../ui-shared/checkin'
 
 /**
  * 「签到中心」标签页：总览卡 + 每日签到 + 新手福利 + 活动套餐 + 成长任务。
@@ -220,17 +222,18 @@ function AccountTable({ group }: { group: ProviderGroup }): React.ReactElement {
       </TableHeader>
       <TableBody>
         {group.accounts.map(account => (
-          <AccountRow key={account.id} account={account} modes={modes} dailyActivity={dailyActivity} />
+          <AccountRow key={account.id} account={account} modes={modes} dailyActivity={dailyActivity} manualPlans={group.manualPlans === true} />
         ))}
       </TableBody>
     </Table>
   )
 }
 
-function AccountRow({ account, modes, dailyActivity }: {
+function AccountRow({ account, modes, dailyActivity, manualPlans }: {
   account: CheckinAccount
   modes: string[]
   dailyActivity: boolean
+  manualPlans: boolean
 }): React.ReactElement {
   const busy = (mode: string) => store.signing.has(`${account.id}:${mode}`)
   return (
@@ -247,6 +250,10 @@ function AccountRow({ account, modes, dailyActivity }: {
         {account.checkedInToday
           ? <Badge variant="success" shape="tag">已签</Badge>
           : <Badge variant="brand" shape="tag">待签</Badge>}
+        {account.dailyCheckin && account.dailyCheckin.totalCount > 0
+          ? <span className="ck-sub"> · {t('已领 {done} / {total} 份套餐', {
+            done: account.dailyCheckin.completedCount, total: account.dailyCheckin.totalCount,
+          })}</span> : null}
       </TableCell>
       <TableCell className="ck-sub">{formatTime(account.checkinAt)}</TableCell>
       <TableCell className="ck-right">
@@ -269,9 +276,15 @@ function AccountRow({ account, modes, dailyActivity }: {
                 size="sm"
                 variant="ghost"
                 disabled={busy('checkin') || !account.available}
-                onClick={() => void signSingle(account.id, 'checkin')}
+                onClick={() => {
+                  if (manualPlans && window.wbZcodePlans?.open) {
+                    window.wbZcodePlans.open({ id: account.id, name: account.name })
+                  } else {
+                    void signSingle(account.id, 'checkin')
+                  }
+                }}
               >
-                {busy('checkin') ? '签到中…' : account.checkedInToday ? '重签' : '签到'}
+                {manualPlans ? t('套餐明细') : busy('checkin') ? '签到中…' : account.checkedInToday ? '重签' : '签到'}
               </Button>
             )}
         </span>
@@ -285,6 +298,7 @@ function ProviderRow({ group }: { group: ProviderGroup }): React.ReactElement {
   const hasAccounts = group.totalCount > 0
   return (
     <CheckinRow provider={group.id} name={group.label} description={group.description}
+      note={group.uiHooks?.includes('umid_component') ? <CheckinUmid /> : undefined}
       expandable={hasAccounts} expanded={expanded} onExpandedChange={setExpanded}
       summary={<>
         <span className="ck-row-count">
@@ -456,9 +470,8 @@ function PlanRow({ row }: { row: PlanEntry }): React.ReactElement {
 function GrowthRow({ row }: { row: GrowthEntry }): React.ReactElement {
   const cache = growthOf(row.id)
   const tasks = cache.tasks ?? []
-  // 能自动执行的：受支持、非「需真实操作」
-  const runnable = tasks.filter(task => task.supported && !task.unforgeable)
-  const pending = runnable.filter(task => task.status !== 'claimed' && task.current < task.target)
+  const runnable = tasks.filter(task => growthTaskRunnable(task, 'full'))
+  const pending = runnable.filter(task => !growthTaskCompleted(task))
   const loaded = cache.status === 'loaded' && tasks.length > 0
   const [expanded, setExpanded] = React.useState(false)
   const running = cache.running || cache.runningSchool
@@ -526,17 +539,17 @@ function GrowthRow({ row }: { row: GrowthEntry }): React.ReactElement {
             </span>
             {result ? <span className="ck-task-pts">{result.message}</span> : null}
             <span className="ck-task-st">
-              {task.unforgeable
-                ? <Badge variant="outline" shape="tag">需真实操作</Badge>
-                : task.supported
-                  ? task.status === 'claimed'
-                    ? <Badge variant="success" shape="tag">已领取</Badge>
-                    : task.status === 'completed'
-                      ? <Badge variant="brand" shape="tag">可领取</Badge>
+              {task.status === 'claimed'
+                ? <Badge variant="success" shape="tag">已领取</Badge>
+                : growthTaskRunnable(task, 'claim')
+                  ? <Badge variant="brand" shape="tag">可领取</Badge>
+                  : task.unforgeable
+                    ? <Badge variant="outline" shape="tag">需真实操作</Badge>
+                    : !task.supported
+                      ? <Badge variant="outline" shape="tag">不支持</Badge>
                       : task.locked
                         ? <Badge variant="outline" shape="tag">未解锁</Badge>
-                        : <Badge variant="warning" shape="tag">待完成</Badge>
-                  : <Badge variant="outline" shape="tag">不支持</Badge>}
+                        : <Badge variant="warning" shape="tag">待完成</Badge>}
             </span>
           </div>
         )

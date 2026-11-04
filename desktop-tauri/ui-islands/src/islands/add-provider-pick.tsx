@@ -8,26 +8,43 @@
  * 原样保留：那是布局性的成套样式（四列网格 + 固定高度滚动 + 卡片三行排版），
  * 组件库没有对应件，重写成 Tailwind 只会把一份已经调好的像素预算再抄一遍。
  * 控件（分段、搜索框）走组件库。
+ *
+ * ── 「全部」段 ──────────────────────────────────────────────
+ * 分段栏最前面一档「全部」（也是打开弹窗的默认段）：它把四个分类的卡片按
+ * 分组带拼在同一屏里，搜索一次跨全部分类。解决的痛点很具体 —— 搜索框只过滤
+ * 当前分段，用户在「API 模板」段搜 Cline、搜 Qoder 只会看到「没有匹配」，
+ * 而要找的那家就在隔壁那段里。单分类段照旧保留：知道找哪一类时它才是最短
+ * 路径，「全部」段每组的「只看这一类」就是把用户收回那条路径的入口。
  */
 
 import * as React from 'react'
-import { DialogSection, InputGroup, InputGroupAddon, InputGroupInput, SegmentedControl, Button, Item } from '@ui'
+import { Alert, InputGroup, InputGroupAddon, InputGroupInput, SegmentedControl, Button, Item } from '@ui'
 
+import { isSuspendedProvider } from '../../../ui-shared/provider-availability'
 import { accountCountOf, shared } from './add-account-bridge'
 import { presetOfProvider, providerPresetIcon, providerSiteLabel } from './add-provider-metadata'
 import { WORKBUDDY_ENTRY_LABEL, WORKBUDDY_PROVIDER } from './add-account-configs'
-import { ADD_SEG_CLASS } from './add-provider-blocks'
+import { DIALOG_SEG_CLASS } from './dialog-segmented'
+import { AddGroup } from './add-account-kit'
 import { t } from '../i18n'
 import { Empty } from '@ui'
 
-/** 第 1 步的账号类型：Agent / Web / API 模板 / 已建 API / 导入 */
-export type AccountType = 'proxy' | 'web' | 'preset' | 'custom' | 'import'
+/** 第 1 步的账号类型：全部 / Agent / Web / API 模板 / 已建 API / 导入 */
+export type AccountType = 'all' | 'proxy' | 'web' | 'preset' | 'custom' | 'import'
 
+export const TYPE_ALL: AccountType = 'all'
 export const TYPE_PROXY: AccountType = 'proxy'
 export const TYPE_WEB: AccountType = 'web'
 export const TYPE_PRESET: AccountType = 'preset'
 export const TYPE_CUSTOM: AccountType = 'custom'
 export const TYPE_IMPORT: AccountType = 'import'
+
+/**
+ * 「全部」段里按顺序列出的分类：与分段栏一一对应（Agent / Web / API 模板 /
+ * 已建 API），顺序也照抄分段栏 —— 两处顺序不一致的话，用户看到的「第几类」
+ * 就对不上，读起来像两套分类。
+ */
+const GROUPED_TYPES: AccountType[] = [TYPE_PROXY, TYPE_WEB, TYPE_PRESET, TYPE_CUSTOM]
 
 /**
  * 「导入」分段是否露出。当前 **false**：这一屏还没做完整，先从界面上收起来。
@@ -46,9 +63,24 @@ export const NEW_PROVIDER_CARD_ID = '__new__'
 
 /** 分段值归一：未知取值按「Agent」处理。 */
 export function typeValueOf(value: string): AccountType {
+  if (value === TYPE_ALL) return TYPE_ALL
   if (value === TYPE_PRESET || value === TYPE_CUSTOM || value === TYPE_WEB) return value
   if (IMPORT_SEGMENT_ENABLED && value === TYPE_IMPORT) return TYPE_IMPORT
   return TYPE_PROXY
+}
+
+/**
+ * 分类的展示名：分段栏的分段与「全部」段的分组带**共用这一份**。
+ * 两处必须是同一个词 —— 带子上写着「API 模板」而分段里是别的叫法，用户就
+ * 对不上「这是刚才那一档」。Agent / Web 是客户端自己的叫法（专名），不进词典。
+ */
+function typeLabelOf(type: AccountType): string {
+  if (type === TYPE_ALL) return t('全部')
+  if (type === TYPE_WEB) return 'Web'
+  if (type === TYPE_PRESET) return t('API 模板')
+  if (type === TYPE_CUSTOM) return t('已建 API')
+  if (type === TYPE_IMPORT) return t('导入')
+  return 'Agent'
 }
 
 /**
@@ -105,6 +137,7 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // （`assets/icon.png`，512×512，与系统里显示的应用图标为同一形象；
   // 归一成 256×256 入库 —— 与 officeace 同一处置）
   chatglm: 'assets/providers/chatglm.png',
+  'deepseek-web': 'assets/providers/deepseek.png',
   // ModelScope（魔搭）：取自官网 favicon（`https://modelscope.cn/favicon.ico`，
   // 内含 128×128 的一帧，归一成 256×256 入库 —— 与站点标签页上显示的是同一形象；
   // 国内 / 国际版共用这一张，同 AutoClaw / MonkeyCode 的形态）
@@ -117,12 +150,32 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // （`cdn-static.gitcode.host/static/images/logo-favicon.png`），不是本产品的形象，
   // 所以没有采用它。
   atomcode: 'assets/providers/atomcode.png',
-  // LobsterAI（网易有道「有道龙虾」）：图标取自 sibling 仓库 cpa-jethub-plugins 里
-  // 已核过的品牌图标（`internal/jethub/brandicons/brandicons.go` 的 `LobsterAI`
-  // 常量 —— 那正是产品站点从有道共享 CDN 引用的同一枚，不是有道自家的 favicon）。
-  // 该处是 24×24 的 SVG，已栅格化成 256×256 RGBA 入库（与 orcaterm / officeace
-  // 同一处置）。
+  // LobsterAI（网易有道「有道龙虾」）：取自官方开源仓库的应用图标
+  // （`build/icons/png/256x256.png`，原尺寸直接入库 —— 红底白龙虾，与官网
+  // `lobsterai.youdao.com/icon-192.png`、README 的 `public/logo.png` 同一形象，
+  // 也就是系统里显示的客户端图标）。⚠️ 早前用的是 sibling 仓库
+  // cpa-jethub-plugins 里那枚 24×24 通用小怪物 SVG，与产品实际形象不符，已换掉。
   lobsterai: 'assets/providers/lobsterai.png',
+  doubaowork: 'assets/providers/doubaowork.png',
+  cursor: 'assets/providers/cursor.svg',
+  kiro: 'assets/providers/kiro.svg',
+  devin: 'assets/providers/devin.svg',
+  factory: 'assets/providers/factory.svg',
+  zed: 'assets/providers/zed.svg',
+  grok: 'assets/providers/grok.svg',
+  'minimax-code': 'assets/providers/minimax-code.svg',
+  'minimax-code-global': 'assets/providers/minimax-code.svg',
+  qwenwork: 'assets/providers/qwenwork.svg',
+  'qwenwork-intl': 'assets/providers/qwenwork.svg',
+  'qwenwork-enterprise': 'assets/providers/qwenwork.svg',
+  'kimi-work': 'assets/providers/kimi-work.svg',
+  opendesign: 'assets/providers/opendesign.svg',
+  'nous-portal': 'assets/providers/nous-portal.svg',
+  'claude-subscription': 'assets/providers/anthropic.png',
+  'codex-subscription': 'assets/providers/openai.png',
+  'chatgpt-subscription': 'assets/providers/openai.png',
+  'copilot-subscription': 'assets/providers/copilot.svg',
+  'gemini-subscription': 'assets/providers/gemini-cli.svg',
 }
 
 /**
@@ -179,6 +232,7 @@ function providerCards(accountType: AccountType): CardItem[] {
   // providerSummaries、models-page 的左栏），不经过这里，所以存量 cline-pass
   // 账号仍照常成组显示。
   const list = (providers?.all?.() || [])
+    .filter(item => !isSuspendedProvider(String(item?.id || '')))
     .filter(item => (item.category === 'web') === (accountType === TYPE_WEB))
     .filter(item => accountType === TYPE_WEB || !HIDDEN_AGENT_PROVIDERS.has(String(item?.id || '')))
   // WorkBuddy 这张卡与它的弹窗标题用**中性品牌名**（不带地区）而不是注册名：
@@ -187,10 +241,17 @@ function providerCards(accountType: AccountType): CardItem[] {
   // 的两半：入口一处、版本在块里选。
   // 注册名（「AutoClaw 国内版」这类）过一遍词典：卡片名与弹窗标题都由它出，
   // 不查表的话非中文界面会在这里印中文
-  const labelOf = (id: string, fallback: string): string =>
-    id === WORKBUDDY_PROVIDER
-      ? WORKBUDDY_ENTRY_LABEL
-      : t(shared().wbProviders?.labelOf?.(id) || fallback)
+  const labelOf = (id: string, fallback: string): string => {
+    if (id === 'minimax-code') return t('MiniMax Code 国内版')
+    if (id === 'minimax-code-global') return t('MiniMax Code 国际版')
+    // 千问办公两版已由「提供商增强」插件实现，名字与插件注册表的 meta 逐字一致
+    // （`千问办公 国内版` / `千问办公 国际版`）。这里仍然要覆盖一次：插件给的
+    // label 是中文源串，只有走 t() 才会被词典翻成其余五种语言。
+    if (id === 'qwenwork') return t('千问办公 国内版')
+    if (id === 'qwenwork-intl') return t('千问办公 国际版')
+    if (id === 'qwenwork-enterprise') return t('QwenWork 千问办公企业版')
+    return id === WORKBUDDY_PROVIDER ? WORKBUDDY_ENTRY_LABEL : t(shared().wbProviders?.labelOf?.(id) || fallback)
+  }
   // 摘要为空**不再兜底放 WorkBuddy 一张**（2026-10 改）：
   // 以前那张兜底卡的理由是「弹窗不能因为一次状态未就绪就空着」，但本版本
   // 转发与账号实现全在插件里，没装插件时它点了必然 503 —— 兜底一张点不动的卡
@@ -318,33 +379,54 @@ export function PickStep({
   const hiddenType = (accountType === TYPE_PROXY && !hasAgentCards)
     || (accountType === TYPE_WEB && !hasWebCards)
   const effectiveType = hiddenType ? (hasWebCards ? TYPE_WEB : TYPE_PRESET) : accountType
-  const cards = React.useMemo(() => providerCards(effectiveType), [effectiveType, version])
   const keyword = search.trim().toLowerCase()
-  const hit = cards.filter(item => !keyword || [item.label, item.site, item.template].filter(Boolean).join(' ').toLowerCase().includes(keyword))
-  // 有关键词时「新建」那张卡收起来 —— 用户在找的是一家
-  const newCard = accountType === TYPE_CUSTOM && !keyword
-  // Agent 段有没有内容：没装插件时后端摘要里一家都没有，这一段就是空的。
-  // 空段不该出现在分段控件里 —— 点进去只有一句「去装插件」，等于把
-  // 「还没装插件」这个状态做成一个可点的分类，用户会以为是功能缺失。
+  const hitOf = (item: CardItem): boolean => !keyword
+    || [item.label, item.site, item.template].filter(Boolean).join(' ').toLowerCase().includes(keyword)
+  // 有关键词时「新建」那张卡收起来 —— 用户在找的是一家。
+  // 「全部」段里它住在「已建 API」组里当第一张（与单分类段的位置一致）
+  const newCard = !keyword && (effectiveType === TYPE_CUSTOM || effectiveType === TYPE_ALL)
+  const grouped = effectiveType === TYPE_ALL
+  /** 这一屏的分组：单分类段只有自己那一组（不带分组带），「全部」段四组按分段栏的顺序排 */
+  const groups = (grouped ? GROUPED_TYPES : [effectiveType]).map(type => ({
+    type,
+    label: typeLabelOf(type),
+    items: providerCards(type).filter(hitOf),
+  }))
+  // 「全部」段：空组整组不出（连分组带一起收），否则找一类得先翻过几条空带子。
+  // 唯一例外是「已建 API」—— 「新建自定义提供商」那张卡住在里面，它永远可达
+  const shownGroups = groups.filter(group => group.items.length > 0
+    || (group.type === TYPE_CUSTOM && newCard))
+  const hit = shownGroups.flatMap(group => group.items)
+  // 四个分类合起来命中多少家：「全部」那一档的计数徽标就是它（没搜索时即总家数）。
+  // 徽标不只是装饰 —— 在「API 模板」段搜 Cline 时它显示 1，等于替「全部」喊了一声
+  const allHitCount = GROUPED_TYPES
+    .reduce((sum, type) => sum + providerCards(type).filter(hitOf).length, 0)
+  // 当前分段里一家没有、别的分类里有：这正是「全部」段要解决的那件事，
+  // 所以给一条提示把人送过去，而不是指望他自己想到去点「全部」。
+  // 此分支下当前分段命中为 0，所以全量命中数就是「其它分类」的命中数
+  const otherHitCount = keyword && !grouped && !hit.length ? allHitCount : 0
+  // Agent 与 Web 只列出已加载且未暂停的提供商。
 
   return (
     // 分段与列表同一块：两者是同一个问题的两面（「给什么形态的上游加账号」→
-    // 「给哪一家加」），分两块带边框会让人以为是两个独立步骤
-    <DialogSection>
-      <h3>{t('选择提供商')}</h3>
+    // 「给哪一家加」），分两块带边框会让人以为是两个独立步骤。
+    // 分组名走 AddGroup 的 label（挂在方框外面），框内第一行是分段 + 搜索。
+    <AddGroup label={t('选择提供商')}>
       {/* 分段与搜索同一行：左边选形态，右边是这一屏的过滤器 */}
       <div className='add-pick-row' style={importing ? { display: 'none' } : undefined}>
         <SegmentedControl
           aria-label={t('账号类型')}
-          className={ADD_SEG_CLASS}
+          className={DIALOG_SEG_CLASS}
           options={[
+            // 默认落在「全部」：搜索一次跨全部分类，不必先猜自己该进哪一段
+            { value: TYPE_ALL, label: typeLabelOf(TYPE_ALL), count: allHitCount },
             // Agent 段只在内置家真的存在时出现（判据见 hasAgentCards）
-            ...(hasAgentCards ? [{ value: TYPE_PROXY, label: 'Agent' }] : []),
-            ...(hasWebCards ? [{ value: TYPE_WEB, label: 'Web' }] : []),
-            { value: TYPE_PRESET, label: t('API 模板') },
-            { value: TYPE_CUSTOM, label: t('已建 API') },
+            ...(hasAgentCards ? [{ value: TYPE_PROXY, label: typeLabelOf(TYPE_PROXY) }] : []),
+            ...(hasWebCards ? [{ value: TYPE_WEB, label: typeLabelOf(TYPE_WEB) }] : []),
+            { value: TYPE_PRESET, label: typeLabelOf(TYPE_PRESET) },
+            { value: TYPE_CUSTOM, label: typeLabelOf(TYPE_CUSTOM) },
             // 「导入」分段暂时收起（见 IMPORT_SEGMENT_ENABLED）：整段不生成
-            ...(IMPORT_SEGMENT_ENABLED ? [{ value: TYPE_IMPORT, label: t('导入') }] : []),
+            ...(IMPORT_SEGMENT_ENABLED ? [{ value: TYPE_IMPORT, label: typeLabelOf(TYPE_IMPORT) }] : []),
           ]}
           value={effectiveType}
           onValueChange={value => onAccountTypeChange(typeValueOf(value))}
@@ -364,6 +446,21 @@ export function PickStep({
           </InputGroup>
         </span>
       </div>
+      {/* 跨分类命中提示：拦在卡片网格上方（不进滚动区），点一下直接切到「全部」 */}
+      {otherHitCount > 0 ? (
+        <Alert className='flex items-center gap-3'>
+          <span>
+            {t('当前分类里没有「{keyword}」，其它分类有 {n} 个匹配', {
+              keyword: search.trim(),
+              n: otherHitCount,
+            })}
+          </span>
+          <Button size='sm' variant='outline' type='button' className='add-provider-hint-go'
+            onClick={() => onAccountTypeChange(TYPE_ALL)}>
+            {t('看全部匹配')}
+          </Button>
+        </Alert>
+      ) : null}
       {/* 导入面板插在卡片网格的位置上（与网格互斥显隐），放在网格之前 ——
           两屏内容同一块区域，滚动位置也就跟着换，不会串 */}
       {importPanel}
@@ -374,27 +471,50 @@ export function PickStep({
         aria-label={t('选择要添加账号的提供商')}
         style={importing ? { display: 'none' } : undefined}
       >
-        {newCard ? <NewProviderCard onPick={onPick} /> : null}
-        {hit.map(item => <ProviderCard key={item.id} item={item} onPick={onPick} />)}
+        {shownGroups.map(group => (
+          // 分组带是通栏的一格（grid-column: 1/-1），卡片仍是同级网格项 ——
+          // 包一层 Fragment 而不是 wrapper，列宽才不会被多包的一层打乱
+          <React.Fragment key={group.type}>
+            {grouped ? (
+              <div className='add-provider-band' role='group' aria-label={group.label}>
+                <span className='add-provider-band-name'>{group.label}</span>
+                {group.items.length ? (
+                  // 复用语料里现成的「{count} 家」（插件页的包内家数）：同一个读数
+                  // 在两处必须是同一句话，新造一条键只会多一份要翻译的空值
+                  <span className='add-provider-band-stat'>{t('{count} 家', { count: group.items.length })}</span>
+                ) : null}
+                <span className='add-provider-band-fill' />
+                <Button size='xs' variant='ghost' type='button' className='add-provider-band-only'
+                  onClick={() => onAccountTypeChange(group.type)}>
+                  {t('只看这一类')}
+                </Button>
+              </div>
+            ) : null}
+            {newCard && group.type === TYPE_CUSTOM ? <NewProviderCard onPick={onPick} /> : null}
+            {group.items.map(item => <ProviderCard key={item.id} item={item} onPick={onPick} />)}
+          </React.Fragment>
+        ))}
         {!hit.length && keyword ? (
           <Empty className='add-provider-empty'>{t('没有匹配「{keyword}」的提供商', { keyword: search.trim() })}</Empty>
         ) : null}
-        {/* 一个都没有、也没在搜索 = 还没装插件包。这是**正常状态**（本版本的
-            转发与账号实现都在插件里），所以文案要指路而不是报错；给一个直达
-            插件页的按钮，省得用户自己去左侧菜单找。 */}
-        {!hit.length && !keyword && effectiveType === TYPE_PROXY ? (
-          <Empty className='add-provider-empty'>
-            <p className='mb-2'>{t('还没有可用的提供商。各家提供商的转发与账号实现都在插件包里，装好之后这里就会出现。')}</p>
-            <Button size='default' variant='ghost'
-              type='button'
-              className='text-primary underline underline-offset-2'
-              onClick={() => shared().wbApp?.showPage?.('plugins')}
-            >
-              {t('去安装提供商插件包')}
-            </Button>
-          </Empty>
-        ) : null}
+        {/* 一个都没有、也没在搜索、也没有「新建自定义提供商」= 还没装插件包。这是
+            **正常状态**（本版本的转发与账号实现都在插件里），所以文案要指路而不是
+            报错；给一个直达插件页的按钮，省得用户自己去左侧菜单找。
+            「全部」段同样走这一条：四类都空而插件没装时，那一屏什么都没有。 */}
+        {!hit.length && !newCard && !keyword
+          && (effectiveType === TYPE_PROXY || effectiveType === TYPE_ALL) ? (
+            <Empty className='add-provider-empty'>
+              <p className='mb-2'>{t('请安装并启用对应的提供商插件；列表为空时请刷新后重试。')}</p>
+              <Button size='default' variant='ghost'
+                type='button'
+                className='text-primary underline underline-offset-2'
+                onClick={() => shared().wbApp?.showPage?.('plugins')}
+              >
+                {t('去安装提供商插件包')}
+              </Button>
+            </Empty>
+          ) : null}
       </div>
-    </DialogSection>
+    </AddGroup>
   )
 }

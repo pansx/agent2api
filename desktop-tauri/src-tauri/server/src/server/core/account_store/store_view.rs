@@ -27,28 +27,14 @@ use crate::server::core::custom_providers;
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
 
-/// 这条账号所属的家，此刻**该不该出现在管理界面上**。
+/// 这条账号所属的家，此刻是否出现在管理界面上。
 ///
-/// ── 判据（只有这一条，别加别的）─────────────────────────────
-/// 内置注册表里没有这个 id（自定义家 / 手改的未知 id）→ 显示；
-/// 在注册表里 → 看插件是否接管（`serves_provider`），没接管就隐藏。
-///
-/// ── 为什么隐藏而不是保留可见（2026-10 用户决定）───────────────
-/// 各家反代的转发 / 账号 / 签到实现已整体搬进插件。没装插件时那些功能
-/// **一个都不可用**，把它们留在列表里就是「看得见、点什么都没反应」——
-/// 用户明确要的是「插件不在，这家就不存在」。数据不动：记录仍在库里，
-/// 导出直接读库（`account_transfer::export_accounts` 不走本函数），
-/// 装上插件后原样回来。
-///
-/// ── 为什么不能统一按「有没有执行体」判 ───────────────────────
-/// 自定义提供商的转发**仍在网关里**（`core::upstream::provider_loop` 按
-/// `custom-` 前缀直连，不经插件），它们没有插件可装 —— 按执行体判会把
-/// 用户自己建的 API 全藏起来。所以先看「是不是内置家的 id」。
-pub(super) fn account_visible(provider: &str) -> bool {
-    if crate::server::core::providers::kind_from_id(provider).is_none() {
-        return true;
-    }
-    crate::server::core::plugin_host::serves_provider(provider)
+/// 本体与真实插件有执行体就显示；旧身份缺插件仍隐藏，数据留在库里。
+/// 自定义提供商独立直连，不经插件；其它账号只认真实执行体，缺插件的
+/// 存量记录继续隐藏而不删除。
+pub(crate) fn account_visible(provider: &str) -> bool {
+    provider.starts_with(custom_providers::ID_PREFIX)
+        || crate::server::core::providers::is_executable_provider(provider)
 }
 
 /// 快照的两种用途：内部逻辑要全部账号，界面只要此刻能用的。
@@ -205,8 +191,7 @@ impl AccountStore {
     /// 上就给出**，前端不必再发第二个请求。计数是各 provider 的账号**总数**
     /// （含禁用账号）—— 与分组标题显示的「N 个账号」口径一致。
     pub fn list_accounts(&self) -> Value {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         self.snapshot(&state, Visibility::All)
     }
 
@@ -216,8 +201,7 @@ impl AccountStore {
     /// 签到中心、成长页…）。没装插件时插件家的账号不出现 —— 用户明确要的是
     /// 「插件不在，这家就不存在」；数据仍在库里，装上插件原样回来。
     pub fn list_visible_accounts(&self) -> Value {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         self.snapshot(&state, Visibility::UserFacing)
     }
 
@@ -246,8 +230,7 @@ impl AccountStore {
     /// 节点，天然跳过）。这一条判据实现复用 `proxy_rotate::candidate_ids` ——
     /// 「哪些条目可能被用到」在取用与预建监听器两处必须是同一个答案。
     pub fn referenced_pool_ids(&self) -> std::collections::HashSet<String> {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in &state.accounts {
             let proxy = record.proxy();
@@ -283,8 +266,7 @@ impl AccountStore {
     /// 按「记录变了就作废旧结论」处理，多作废一条失败提示，比留着一条过期结论
     /// 更轻 —— 用户手点一次查询就能得到新的（见 `usage_query` 的说明）。
     pub fn account_change_times(&self) -> HashMap<String, i64> {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
+        let state = self.read_state();
         state
             .accounts
             .iter()
@@ -306,11 +288,8 @@ impl AccountStore {
     /// 导出（`account_transfer::export_accounts`）直接读库、不经这里；
     /// 装上插件后这些账号原样回来。
     ///
-    /// ⚠️ **不能**用「有没有执行体」当统一判据：自定义提供商（`custom-` 前缀）
-    /// 的转发仍在网关里（`core::upstream::provider_loop` 按前缀直连），它们
-    /// 没有插件可装、也不该被隐藏。所以判据只作用于**内置注册表里的 id**：
-    /// 在注册表里且插件没接管 ⇒ 隐藏；注册表外（自定义家 / 手改的未知 id）
-    /// ⇒ 原样显示。
+    /// 自定义提供商独立直连；本体订阅与真实插件按 `account_visible` 的执行体
+    /// 并集判定。旧身份缺插件仍隐藏，记录与导出内容不受展示过滤影响。
     pub(crate) fn snapshot(&self, state: &AccountState, visibility: Visibility) -> Value {
         // 过滤一次、克隆一次（两个队首派生函数都要 `&[StoredAccount]`）
         let mut visible: Vec<StoredAccount> = Vec::with_capacity(state.accounts.len());
@@ -344,7 +323,7 @@ impl AccountStore {
             .unwrap_or(Value::Null);
         // 隐藏摘要独立于可见账号数量，混有自定义账号时也必须能解释缺失的部分。
         let hidden = super::hidden_accounts::summary(hidden);
-        json!({
+        let mut snapshot = json!({
             "currentAccountId": global_current,
             "currentAccountIds": Value::Object(current_ids),
             "accounts": visible
@@ -353,7 +332,9 @@ impl AccountStore {
                 .collect::<Vec<_>>(),
             "providers": self.provider_summary(&visible),
             "hiddenAccounts": hidden,
-        })
+        });
+        crate::server::core::account_order::enrich_snapshot(&mut snapshot);
+        snapshot
     }
 
     /// 记录 → 公开形态（**按 provider 分派**）。
@@ -503,6 +484,13 @@ impl AccountStore {
         };
         match shaped {
             Value::Object(mut fields) => {
+                for key in ["upstreamCooldownUntil", "upstreamBlockedReason"] {
+                    if let Some(value) = record.get(key) { fields.insert(key.to_string(), value.clone()); }
+                    else { fields.remove(key); }
+                }
+                if !record.has_plugin_secret() {
+                    super::plugin_public::credential_fields(record, &mut fields);
+                }
                 fields.insert(
                     "hasCredentials".to_string(),
                     Value::Bool(record.has_credentials()),
@@ -569,6 +557,9 @@ impl AccountStore {
                     }
                 }
                 fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
+                fields.insert("checkedInToday".to_string(), Value::Bool(super::checkin_state::completed(record)));
+                fields.insert("dailyCheckin".to_string(), super::checkin_state::record_status(record)
+                    .cloned().unwrap_or(Value::Null));
                 // 成长中心连登天数（WorkBuddy 国内版；签到后回读落库，见
                 // `AccountStore::mark_streak_days`）。恒为数字键（0 = 还没读到过），
                 // 与 checkinAt 同一理由：界面按数字读，不必判「字段缺失」。
@@ -717,8 +708,7 @@ impl AccountStore {
     /// auth.json，同样算「有凭证」，见 `state.rs` 的说明）。返回值是**排序后**的：
     /// 调用方按序尝试即可，不必自己再排一遍 —— 优先级的相对顺序就是主备顺序。
     pub fn accounts_for_provider(&self, provider: &str) -> Vec<Value> {
-        let _guard = self.guard();
-        let records = self.records_for_provider(&_guard, provider);
+        let records = self.read_provider(provider);
         let mut records: Vec<StoredAccount> = records
             .into_iter()
             .filter(|record| record.enabled() && record.has_credentials())

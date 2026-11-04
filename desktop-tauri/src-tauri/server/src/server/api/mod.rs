@@ -35,9 +35,11 @@
 
 // 「Agent」页：本机 AI 客户端配置接管（列表 / 保存 / 写入 / 预览 / 还原 / 导入）
 pub mod agents;
+pub mod agent_resources;
 pub mod accounts;
 pub mod accounts_batch;
 mod accounts_export;
+mod accounts_sort;
 // `/api/accounts/usage` 的查询与结果组装（从 accounts.rs 拆出：余额能力从
 // 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
 pub mod accounts_usage;
@@ -45,6 +47,7 @@ pub mod accounts_usage;
 // 设置读写与流式对话转发。工具定义与执行都在前端，后端不认识任何工具，
 // 见该文件模块头
 pub mod assistant;
+pub mod assistant_history;
 pub mod assistant_images;
 mod image_input;
 // 整库备份 / 恢复（设置页「整库备份 / 恢复」，SQL 文本形态；核心在
@@ -103,6 +106,7 @@ pub mod keys_api;
 pub mod keepalive;
 pub mod logs_api;
 pub mod model_manage;
+pub(crate) mod model_access;
 // models.dev 模型元数据（开关 / 状态 / 立即刷新）：与「逐家上游目录」的
 // /api/models/refresh 分开，理由见该文件模块头
 pub mod model_meta;
@@ -114,6 +118,8 @@ pub mod models;
 pub mod onboarding;
 pub mod panel;
 pub mod pipeline;
+mod live_progress;
+mod record_persist;
 // 提供商插件包的管理面（列表 / 安装 / 卸载 / 启停）：插件是用户安装的，
 // 这一组端点就是「装插件」的唯一入口，见该文件模块头
 pub mod plugins;
@@ -128,12 +134,18 @@ pub mod protocol;
 pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
+// 会话图片压缩设置（GET/PUT /api/image-compress）：开关 + 长边 / 质量 / 阈值三项，
+// 实施点在 `core::upstream::payload` 的 send_body（只作用在对话链路，生图不经过），
+// 见该文件模块头
+pub mod image_compress;
 pub mod retry_api;
+pub(crate) mod request_prepare;
 // 开发者角色兼容开关（GET/PUT /api/developer-role-compat）：与 /api/sanitize
 // 同形的单开关端点，转换实施点在 `core::upstream::payload` 的 send_body，
 // 见该文件模块头
 pub mod role_compat;
 pub mod routing_api;
+pub mod routing_flow;
 pub mod routing_trace;
 pub mod routing_workspace;
 pub mod sanitize;
@@ -144,7 +156,6 @@ pub mod session;
 pub mod sidebar_layout;
 pub mod stats_api;
 pub mod storage_api;
-pub mod subscriptions;
 pub mod timeouts_api;
 pub mod update;
 pub mod upgrade_api;

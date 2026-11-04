@@ -157,6 +157,8 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // GitHub 检查、余额查询、模型刷新、凭证维护各多打一轮上游请求。
     // 属于「其它零散状态」：配置写入绝不能动它（否则排期归零、重启又立刻重跑）。
     "backgroundTaskState",
+    // 最近一次损坏任务状态的原文与恢复信息，仅供本机诊断，不参与配置或云同步。
+    "backgroundTaskStateRecovery",
     // 旧「定时查询积分」的结果快照（全局任务已退役）：键保留在保留清单里是
     // 刻意的 —— `core::usage_records` 启动时把它的行导入 account_usage_records
     // 表后删除本键；若那次迁移失败，这里不让配置写入把唯一的迁移来源误清掉。
@@ -167,14 +169,9 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 它不是配置项（配置写入绝不能动它，否则用户配好的代理会被改一次 API Key
     // 清空）。条目不落独立表、只整份读写，理由见那个模块头。
     "proxyPool",
-    // 代理设置（core::proxy_settings）：`{listenerPortBase, listenerPortEnd,
-    // testUrl}` 一个键 —— 「网络代理」页设置弹窗维护的节点监听端口范围与
-    // 出口测试网址。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能
-    // 动它（否则用户改一次 API Key 端口范围就退回默认、大订阅又分配不出端口）。
+    // 测试目标与旧端口范围共存于历史记录，配置写入不能清掉这份数据。
     "proxySettings",
-    // 订阅（core::subscriptions）：整份 `{items: [...]}` 一个键 —— 「网络代理」
-    // 页「订阅管理」维护的订阅链接，内核（sub_kernel）拉起时从 api 层拿启用
-    // 清单。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能动它。
+    // 订阅功能已下线；保留旧数据，不因修改网关配置而删除。
     "subscriptions",
     // models.dev 模型元数据的刷新结果（core::model_meta::snapshot）：整份
     // 「上次成功拉到的精简索引」一个键（文件形态与内嵌快照逐字相同，生成口径见
@@ -328,8 +325,20 @@ pub fn is_reserved(key: &str) -> bool {
 /// 助手从「一次性对话」变成「有历史记录的会话」：左边一列会话、右边一条消息流，
 /// 关掉页面再回来还能接着聊。存**整条消息流的 JSON**（而不是逐条消息一行）的
 /// 理由与 `kv` 表同一取向：读写单元天然是「一整个会话」，逐条存只会让每次保存
-/// 变成 N 次写入 + 一次事务，而没有任何一处需要「按单条消息查」。
-pub const SCHEMA_VERSION: i64 = 20;
+/// 变成 N 次写入 + 一次事务，而没有任何一处需要「按单条消息查询」。
+///
+/// ── 版本 22：清掉模型目录刷新的假失败冷却（[`reset_model_refresh_cooldown`]）
+/// 这是一次**纯数据修复**（无 DDL）：旧成败判据把「任一家失败」当成整轮失败，
+/// 于是一家的长期 401 就能把整条任务按到 24 小时冷却上，界面上显示成「冷却中」。
+/// 判据已改成 `round_succeeded`，但存量库里的 `failures` / `retryAt` 得在这里
+/// 清一次，否则升级后仍要干等旧冷却到期 —— 修复等于没生效。
+///
+/// ── 版本 23：requests 补「积分消耗」一列（[`V23_SCHEMA`]）─────────
+/// 有些提供商（已实测 WorkBuddy 的 `usage.credit`）会按请求上报积分消耗，
+/// 请求日志新增「积分」列读它。与 token 四列刻意不同：这一列**可空 REAL** ——
+/// `NULL` = 这一家没上报（旧行 / 不提供该读数），0 = 确实零消耗；用 0 兜底会
+/// 把「没读到」画成「花了 0 积分」，比缺一列更难排查。
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -746,8 +755,8 @@ ALTER TABLE requests ADD COLUMN route TEXT;
 ///   - `ts`：记账时刻（毫秒，`logging::now_ms` 同口径；排序与翻页游标）；
 ///   - `date`：北京时间 `YYYY-MM-DD`（上游自然日，`core::beijing` 的日期键 ——
 ///     「哪天的签到」按它算，跟机器时区无关，与调度判定同一份口径）；
-///   - `source`：触发来源 `schedule / startup / manual / single / activity`
-///     （见 `core::checkin_records` 的模块头），界面显示为「来源」列；
+///   - `source`：触发来源 `schedule / makeup / startup / manual / single /
+///     activity`（见 `core::checkin_records` 的模块头），界面显示为「来源」列；
 ///   - `reason`：给日志看的那句（「到点触发（08:00）」「手动签到」…），原样存；
 ///   - `account_id` / `account_name` / `provider`：账号三件套（结果行里就有，
 ///     原样复制；账号删除后历史行仍然可读）；
@@ -873,6 +882,19 @@ SELECT 'legacy:' || row_id, account_id,
        CASE WHEN upstream_model != '' THEN upstream_model ELSE model END,
        ts, MAX(total_tokens, 0), 1
 FROM requests WHERE account_id != '' AND status != 0 AND attempts > 0;
+";
+
+/// 版本 23：requests 补「积分消耗」一列（schema v23）。
+///
+/// 与 v5 / v7 / v10 / v12 同一形态（既有表加列，单条 ALTER，幂等靠版本号）。
+/// 为什么是 **REAL 且可空**，而不是像 token 四列那样 `INTEGER NOT NULL DEFAULT 0`：
+///   · 上游的 `credit` 是小数（WorkBuddy 实测 0.03～0.31），整数列会把读数截断；
+///   · `NULL` 表达「这一家没上报 / 旧行没有」，0 表达「上报了 0」。展示层对前者
+///     显示「—」、对后者显示「0」—— 把两者并成 0 会让「没读到」看起来像
+///     「这条请求免费」，正是余额/用量一列最怕的那种假读数。
+const V23_SCHEMA: &str = "
+-- ── requests 补积分消耗列（schema v23）──────────────────────
+ALTER TABLE requests ADD COLUMN credit REAL;
 ";
 
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
@@ -1045,6 +1067,69 @@ fn apply_version(
         18 => conn.execute_batch(include_str!("schema_source_stats.sql")),
         19 => conn.execute_batch(include_str!("schema_assistant_images.sql")),
         20 => conn.execute_batch(include_str!("schema_debug_raw.sql")),
+        21 => conn.execute_batch(include_str!("schema_assistant_title.sql")),
+        // v22：清掉「模型目录刷新」在旧成败判据下累积的假失败冷却（见 V22 注释）
+        22 => reset_model_refresh_cooldown(conn),
+        // v23：requests 补「积分消耗」一列（请求日志的积分列，见 V23_SCHEMA）
+        23 => conn.execute_batch(V23_SCHEMA),
         _ => Ok(()),
     }
+}
+
+/// 版本 22：把「模型目录刷新」那条任务的**失败冷却**清掉（数据修复，无 DDL）。
+///
+/// ── 修的是什么 ──────────────────────────────────────────────
+/// 旧判据是 `failed == 0`（`core::scheduled_tasks::run_backend` 的
+/// `TASK_MODEL_REFRESH` 分支）：**任何一家**提供商刷新失败就把整轮算作失败。
+/// 而逐家失败是常态 —— 一家的登录态被上游作废（例如 CatPaw 的长期 401）就足以
+/// 让每一轮都失败一次，`failures` 于是按 `1h × 2^(n-1)` 一路顶到 24 小时上限，
+/// 其余能刷的家跟着一起停在旧清单上。界面上表现为「冷却中，N 小时后重试」，
+/// 看起来就是刷新功能坏了。
+///
+/// 判据已改成与凭证维护同一条（`round_succeeded`：有成功就不算整轮失败），
+/// 但**存量库里那串失败计数与 `retryAt` 还在**：不在这里清一次，用户升级后
+/// 仍要干等到旧冷却到期（实测能到二十多小时），等于修复不生效。
+///
+/// ── 为什么只清模型刷新这一条 ─────────────────────────────────
+/// 别的任务没有这个误判来源，它们的冷却记的是真实失败（断网 / 上游故障），
+/// 一并清掉等于替用户提前解封、白打一轮上游。
+///
+/// ── 为什么在这里做而不是写个一次性标记键 ─────────────────────
+/// `user_version` 本身就是「每个版本只跑一次」的事实来源（见 [`migrate`]），
+/// 复用它零新增状态；而 kv 里再放一个标记键还要登记进 `RESERVED_KV_KEYS`，
+/// 否则一次配置写入就会把它当「已删除的键」清掉、下次启动重跑一遍。
+///
+/// 失败不致命：状态是 `kv.backgroundTaskState` 里的一份 JSON，读不到 / 解析不出
+/// 就当作「没有要修的」，不让它挡住整个升级。
+fn reset_model_refresh_cooldown(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+    use serde_json::{json, Map, Value};
+
+    let text: Option<String> = conn
+        .query_row("SELECT value FROM kv WHERE key = 'backgroundTaskState'", [], |row| row.get(0))
+        .optional()?;
+    let Some(text) = text else { return Ok(()) };
+    let Ok(mut states) = serde_json::from_str::<Map<String, Value>>(&text) else {
+        return Ok(());
+    };
+    // 任务级键就是任务 id 本身（`scheduled_tasks::state_key`：模型刷新不是更新
+    // 检查那种带仓库前缀的特例）。逐家的 `modelRefresh:<provider>` 键不动 ——
+    // 它们的冷却记的是各家自己的失败，与这条误判无关。
+    let Some(state) = states.get_mut("modelRefresh").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let had_cooldown = state.get("retryAt").and_then(Value::as_i64).unwrap_or(0) > 0
+        || state.get("failures").and_then(Value::as_u64).unwrap_or(0) > 0;
+    if !had_cooldown {
+        return Ok(());
+    }
+    state.insert("retryAt".to_string(), json!(0));
+    state.insert("failures".to_string(), json!(0));
+    let encoded = serde_json::to_string(&states)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    conn.execute(
+        "UPDATE kv SET value = ?1 WHERE key = 'backgroundTaskState'",
+        rusqlite::params![encoded],
+    )?;
+    Ok(())
 }

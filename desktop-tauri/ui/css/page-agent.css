@@ -84,9 +84,9 @@
   background: var(--rail-bg);
 }
 .agent-rail-scroll {
-  --ui-selection-bg: var(--surface);
-  --ui-selection-border: var(--border);
-  --ui-selection-shadow: var(--shadow-1);
+  /* 选中色不再在本页覆盖：全站侧栏统一走主色实心块（见 ui-kit/styles/nav.css
+     与 theme.css 的 --ui-nav-selected-*）。原先这里是「浅色 --surface / 深色
+     --surface-2 + 描边 + 投影」的浮起小卡片，与其它侧栏是两套观感。 */
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
@@ -106,7 +106,7 @@
   letter-spacing: .08em;
   white-space: nowrap;
 }
-.agent-rail-label:first-child { margin-top: 0; }
+.agent-rail-label:first-of-type { margin-top: 0; }
 .agent-rail-label::after { content: ""; flex: 1; height: 1px; background: var(--hairline); }
 
 .agent-client {
@@ -126,11 +126,6 @@
   justify-content: flex-start;
 }
 .agent-client:hover:not(:disabled):not([data-active]) { background: var(--nav-hover); border-color: transparent; }
-/* 深色下 --surface 比 --rail-bg 暗：选中行换亮一档的 --surface-2 */
-:root[data-theme="dark"] .agent-rail-scroll { --ui-selection-bg: var(--surface-2); }
-@media (prefers-color-scheme: dark) {
-  :root[data-theme="system"] .agent-rail-scroll { --ui-selection-bg: var(--surface-2); }
-}
 .agent-client.is-missing { opacity: .52; }
 .agent-client-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .agent-client-name {
@@ -506,7 +501,25 @@
 .agent-profile.agent-profile-v2 { grid-template-columns: minmax(0, 1fr); }
 .agent-profile-v2 .agent-profile-act { justify-content: flex-end; }
 .agent-profile-models { display: flex; gap: 5px 10px; flex-wrap: wrap; overflow-wrap: anywhere; }
-.agent-config-dialog { width: min(820px, calc(100vw - 48px)); }
+.agent-config-dialog[data-slot='dialog-content'] {
+  width: min(900px, calc(100vw - 48px));
+  max-height: calc(100dvh - 48px);
+}
+.agent-config-dialog > [data-slot='dialog-header'],
+.agent-config-dialog > [data-slot='dialog-footer'] { flex: 0 0 auto; }
+.agent-config-dialog > [data-slot='dialog-body'] {
+  flex: 1 1 auto;
+  min-height: 0;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  overflow-anchor: none;
+}
+/* 裁剪内容的卡片不能参与正文的高度收缩，否则长列表只剩边框。 */
+.agent-config-dialog > [data-slot='dialog-body'] > * { flex-shrink: 0; }
+.agent-config-dialog .agent-models-fields { border-top: 1px solid var(--hairline); padding-top: 16px; }
+.agent-config-dialog [data-slot='field-label'] { flex-wrap: wrap; }
+.agent-config-dialog [data-slot='field-label'] code { min-width: 0; overflow-wrap: anywhere; }
+.agent-model-list > .agent-model-card { flex: 0 0 auto; }
 .agent-preview-file { min-width: 0; }
 .agent-line-sign { width: 16px; flex: none; user-select: none; }
 .agent-line.is-removed { background: var(--danger-soft); }
@@ -515,7 +528,8 @@
   .agent-dhead { flex-wrap: wrap; }
   .agent-dhead-actions { margin-left: auto; }
   .agent-toolbar { flex-wrap: wrap; }
-  .agent-config-dialog { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); }
+  .agent-config-dialog[data-slot='dialog-content'] { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); }
+  .agent-config-footer { flex-wrap: wrap; }
   .agent-detail { padding: 12px; }
 }
 

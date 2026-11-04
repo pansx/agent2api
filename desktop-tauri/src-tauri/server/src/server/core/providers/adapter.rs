@@ -151,6 +151,9 @@ pub struct ChatRequestPlan {
     pub body: Value,
     /// 上游**响应**说的是哪套协议（默认 [`UpstreamResponse::Chat`]）
     pub response: UpstreamResponse,
+    /// 插件出站归一后的档位；外层 None 为未提供，Some(None) 为明确无档位。
+    pub reasoning: Option<Option<String>>,
+    pub policy: super::policy::ChatPolicy,
 }
 
 impl ChatRequestPlan {
@@ -169,6 +172,8 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::Chat,
+            reasoning: None,
+            policy: super::policy::ChatPolicy::default(),
         }
     }
 
@@ -187,6 +192,8 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::AiSdkNdjson,
+            reasoning: None,
+            policy: super::policy::ChatPolicy::default(),
         }
     }
 
@@ -208,6 +215,8 @@ impl ChatRequestPlan {
             headers,
             body,
             response: UpstreamResponse::AntigravityGemini,
+            reasoning: None,
+            policy: super::policy::ChatPolicy::default(),
         }
     }
 }
@@ -542,19 +551,11 @@ pub trait ProviderAdapter: Send + Sync {
     ///   - `model_rules::reasoning_rank(level)`：通用 6 档的强弱序号
     ///     （0 = minimal … 5 = max），表外的自定义等级返回 None。
     ///     CatPaw 拿它 `rank / 2` 折成自己的三档（见那家适配器的实现）；
-    ///     自定义等级一律 `Skip` —— 用户可能填了任何东西，而错值在 CatPaw 是
-    ///     当场 400，在别家是未知参数，都不如不注入。
+    ///     表外值没有通用强弱序；只有本家目录明确声明支持时才可注入。
     ///
     /// ── 为什么默认是「不接」而不是「透传一个通用字段」────────────
-    /// 默认实现返回 `Skip`，且**所有没覆写的家都应当保持它**。理由是本项目的
-    /// 一条既有事实：多数家（workbuddy / 小浣熊 / Cline 等）的
-    /// `build_chat_request` 是 `body.clone()` 原样透传，需要翻译档位的家
-    /// 各有各的现算路径（见各适配器对 [`Self::reasoning_patch`] 的覆写）——
-    /// **没有任何证据**表明它们认识一个通用档位
-    /// 字段。给上游塞一个它不认识的键不叫「让绑定生效」，只是把未知参数推过去：
-    /// 好一点的情况是被忽略（用户以为生效了，其实没有），坏一点是 400。
-    /// 所以接一家要有一家的证据（上游枚举、实测、上游自己的 resolver 认这个键），
-    /// 并在这里覆写；「看起来应该支持」不是证据。
+    /// 默认实现返回 `Skip`。字段名和模型档位范围必须由实现确认，不能仅凭
+    /// supportsReasoning 推断可调；WorkBuddy 的判定与归一在提供商插件内。
     ///
     /// ── 实现必须自己判的第三条：客户端是不是已经指定了 ──────────────
     /// 客户端在请求体里显式传了档位（CatPaw 的 `reasoning_effort` /
@@ -634,6 +635,14 @@ pub trait ProviderAdapter: Send + Sync {
         !(200..300).contains(&status)
     }
 
+    fn is_error_response_async<'a>(
+        &'a self,
+        status: u16,
+        headers: &'a HeaderMap,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.is_error_response(status, headers)) })
+    }
+
     /// 判定上游错误类型（status + 已解析的错误体）。
     ///
     /// `error_body` 是**已归一化**的错误对象：至少含 `code`（上游业务码，
@@ -661,6 +670,14 @@ pub trait ProviderAdapter: Send + Sync {
         Box<dyn std::future::Future<Output = UpstreamErrorClass> + Send + 'a>,
     > {
         Box::pin(async move { self.classify_error(status, error_body) })
+    }
+
+    fn error_policy_async<'a>(
+        &'a self,
+        _status: u16,
+        _body: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = super::policy::ErrorPolicy> + Send + 'a>> {
+        Box::pin(async { super::policy::ErrorPolicy::default() })
     }
 
     /// 会话式转发（`attempt_stateful`）失败后的分类。
@@ -1190,6 +1207,39 @@ pub trait ProviderAdapter: Send + Sync {
         })
     }
 
+    /// 动态登录方式的可选元数据通道（不新增协议类型）。
+    /// 只读 `auth.methods`：旧插件返回 404 / 501 时给 None，旧登录入口不依赖它。
+    /// 返回值仍不可信；管理路由必须投影成纯文本字段，不能透出 HTML 或凭证值。
+    fn login_methods_metadata<'a>(
+        &'a self,
+        store: &'a AccountStore,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Value>, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match self.admin_action(store, "", "auth.methods", &serde_json::json!({})).await {
+                Ok(metadata) => Ok(Some(metadata)),
+                Err(error) if matches!(error.status_code, 404 | 501) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// 参数化登录启动：options 是已校验的 `{methodIndex, inputs, proxy}`。
+    /// 默认委托旧入口；跨进程实现把整份 options 放进 `login.start.payload`，
+    /// 因为旧 SDK 不会把顶层 methodIndex / inputs / proxy 传给 provider。
+    fn build_login_flow_with_options<'a>(
+        &'a self,
+        _options: Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginStart>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        Box::pin(async move { Ok(self.login_start_async().await) })
+    }
+
     /// 轮询一次登录进度（**轮询型流程用**，插件架构新增）。
     ///
     /// 只有平台把 `poll_interval_ms` 报成 `> 0` 时才会被调用。默认返回错误：
@@ -1265,6 +1315,33 @@ pub trait ProviderAdapter: Send + Sync {
                 ),
             ))
         })
+    }
+
+    /// 不落库的回调入口：保留完整 URL、授权码与 Pending 语义。
+    /// 默认 None 表示继续走既有 `exchange_login_code`；插件覆写后只在 Done 时
+    /// 由登录服务调用 `persist_login_account`，Pending 只表示已接受、继续等待。
+    fn login_callback_poll_async<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _callback: agent2api_provider_protocol::LoginCallback,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginPoll>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// 取消插件侧登录流程（释放监听端口及暂存凭证），不删除已落库账号。
+    /// 默认无操作以兼容旧适配器；网关任务仍须先被取消，避免迟到 Done 落库。
+    fn login_cancel_async<'a>(
+        &'a self,
+        _flow: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(()) })
     }
 
     /// 本 provider 是否支持**余额 / 积分查询**（模块头扩展 8）。
@@ -1568,7 +1645,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 /// 插件是**用户安装**的：没装那个包、或者包被停用，provider 就不存在。
 /// 这是真实状态，必须表达出来 —— 不能像内置家那样假装「一定有」。
 ///
-/// ── 优先级：**插件优先**（全部迁完后的口径）───────────────────
+/// ── 优先级：插件 → 旧 Kind 占位 ─────────────────────────────
 /// 一个 id 同时被内置家与插件声明时，插件赢。三条理由：
 ///   1. 迁移已经完成：21 家全部有插件实现，内置那份只剩「卸载插件后的
 ///      兜底」这一个用途 —— 让兜底赢等于让插件永远不生效；
@@ -1582,12 +1659,21 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 /// 所以另开 [`builtin_adapter_by_id`]：需要「一定走内置那份」的调用点
 /// （迁移期对照、插件实现出问题时的诊断入口）用它，而不是依赖这里的优先级。
 pub fn adapter_by_id(id: &str) -> Option<Arc<dyn ProviderAdapter>> {
+    if super::availability::is_suspended(id) { return None; }
     // 插件家优先（见上面第 3 条：没装/停用时自然落到内置）
     if let Some(adapter) = crate::server::core::plugin_host::lookup(id) {
         return Some(adapter);
     }
     // 内置家兜底
     super::kind_from_id(id).map(Into::into)
+}
+
+pub async fn adapter_by_id_ready(id: &str) -> Result<Option<Arc<dyn ProviderAdapter>>, GatewayError> {
+    if super::availability::is_suspended(id) { return Ok(None); }
+    if let Some(adapter) = crate::server::core::plugin_host::lookup_ready(id).await? {
+        return Ok(Some(adapter));
+    }
+    Ok(super::kind_from_id(id).map(Into::into))
 }
 
 /// **只**查内置实现（跳过插件注册表）。
@@ -1671,6 +1757,14 @@ impl ProviderAdapter for BuiltinAdapter {
 
     fn is_error_response(&self, status: u16, headers: &HeaderMap) -> bool {
         adapter_for(self.0).is_error_response(status, headers)
+    }
+
+    fn is_error_response_async<'a>(
+        &'a self,
+        status: u16,
+        headers: &'a HeaderMap,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, GatewayError>> + Send + 'a>> {
+        adapter_for(self.0).is_error_response_async(status, headers)
     }
 
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
@@ -1883,6 +1977,49 @@ impl ProviderAdapter for BuiltinAdapter {
         >,
     > {
         adapter_for(self.0).login_start_async()
+    }
+
+    fn login_methods_metadata<'a>(
+        &'a self,
+        store: &'a AccountStore,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Value>, GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).login_methods_metadata(store)
+    }
+
+    fn build_login_flow_with_options<'a>(
+        &'a self,
+        options: Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginStart>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        adapter_for(self.0).build_login_flow_with_options(options)
+    }
+
+    fn login_callback_poll_async<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        callback: agent2api_provider_protocol::LoginCallback,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<agent2api_provider_protocol::LoginPoll>, GatewayError>>
+                + Send + 'a,
+        >,
+    > {
+        adapter_for(self.0).login_callback_poll_async(store, callback)
+    }
+
+    fn login_cancel_async<'a>(
+        &'a self,
+        flow: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), GatewayError>> + Send + 'a>,
+    > {
+        adapter_for(self.0).login_cancel_async(flow)
     }
 
     fn login_poll_async<'a>(

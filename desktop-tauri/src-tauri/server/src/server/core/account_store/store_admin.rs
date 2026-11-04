@@ -36,6 +36,8 @@
 //! 要么全不成 —— 中断留下「部分账号改了 id、部分没改」的中间态会让同一批
 //! 账号散在两个 provider 组里。
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{json, Map, Value};
 
 use crate::server::config;
@@ -85,11 +87,28 @@ impl AccountStore {
             .is_ok()
     }
 
+    pub fn suspend_upstream_account(&self, id: &str, reason: &str) -> Result<(), String> {
+        let guard = self.guard();
+        let mut record = self.record_by_id(&guard, id).ok_or_else(|| "账号不存在".to_string())?;
+        record.set_enabled(false);
+        record.set("upstreamBlockedReason", Value::String(truncate_chars(reason, 300)));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)).map_err(|error| error.to_string())
+    }
+
+    pub fn cooldown_upstream_account(&self, id: &str, until: i64, reason: &str) -> Result<(), String> {
+        let guard = self.guard();
+        let mut record = self.record_by_id(&guard, id).ok_or_else(|| "账号不存在".to_string())?;
+        if until <= logging::now_ms() { return Ok(()); }
+        record.set("upstreamCooldownUntil", Value::from(until));
+        record.set("upstreamBlockedReason", Value::String(truncate_chars(reason, 300)));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record)).map_err(|error| error.to_string())
+    }
+
     /// 账号是否被标记为「需要重新登录」（凭证维护据此跳过）。
     pub fn needs_relogin(&self, id: &str) -> bool {
-        let _guard = self.guard();
-        self.record_by_id(&_guard, id)
-            .and_then(|record| record.get("needsRelogin").and_then(Value::as_bool))
+        self.read_record(id).and_then(|record| record.get("needsRelogin").and_then(Value::as_bool))
             .unwrap_or(false)
     }
 
@@ -228,6 +247,11 @@ impl AccountStore {
     ///
     /// 冷却键形态见 `mark_rate_limited`：键在账号记录内，provider 由账号唯一确定。
     pub fn clear_rate_limit(&self, id: &str, model: &str) -> bool {
+        if !self.route_account(id).is_some_and(|account| {
+            account.get("rateLimits").and_then(|limits| limits.get(model)).is_some()
+        }) {
+            return false;
+        }
         let _guard = self.guard();
         let Some(mut record) = self.record_by_id(&_guard, id) else {
             return false;
@@ -260,11 +284,13 @@ impl AccountStore {
         let count = match record.get("rateLimits") {
             Some(Value::Object(limits)) => limits.len(),
             _ => 0,
-        };
+        } + usize::from(record.get("upstreamCooldownUntil").is_some());
         if count == 0 {
             return 0;
         }
         record.remove("rateLimits");
+        record.remove("upstreamCooldownUntil");
+        if record.enabled() { record.remove("upstreamBlockedReason"); }
         record.set_updated_at(logging::now_ms());
         if self
             .with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
@@ -433,6 +459,68 @@ impl AccountStore {
         cleaned
     }
 
+    /// Trae 历史模型 ID 清理：账号上的限额冷却键、限制器条件里的模型名
+    /// 按目录缓存给出的旧名映射改成原始 ID。
+    ///
+    /// 只处理 provider 为 `trae` 的记录；**只改映射里确实出现过的旧名**，
+    /// 不按后缀猜——上游真名恰好以 `-solo` 结尾时不能被误伤。
+    /// 一次读、一次差异写（与 `migrate_startup` 同一取向）；没有改动时不落库。
+    pub fn migrate_trae_model_ids(&self, mapping: &HashMap<String, String>) -> usize {
+        if mapping.is_empty() {
+            return 0;
+        }
+        let _guard = self.guard();
+        let mut state = self.load(&_guard);
+        let now = logging::now_ms();
+        let mut changed = 0usize;
+        for record in state.accounts.iter_mut() {
+            if !record.provider().eq_ignore_ascii_case("trae") {
+                continue;
+            }
+            let mut touched = false;
+            if let Some(Value::Object(limits)) = record.get("rateLimits").cloned() {
+                let mut next = Map::new();
+                for (key, value) in limits {
+                    let base = mapping.get(&key.trim().to_ascii_lowercase());
+                    if base.is_some() {
+                        touched = true;
+                    }
+                    next.entry(base.cloned().unwrap_or(key)).or_insert(value);
+                }
+                if touched {
+                    if next.is_empty() {
+                        record.remove("rateLimits");
+                    } else {
+                        record.set("rateLimits", Value::Object(next));
+                    }
+                }
+            }
+            for field in ["limiterGroups", "limiters"] {
+                let Some(mut value) = record.get(field).cloned() else {
+                    continue;
+                };
+                if rewrite_models_arrays(&mut value, mapping) {
+                    record.set(field, value);
+                    touched = true;
+                }
+            }
+            if touched {
+                record.set_updated_at(now);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            if let Err(error) = self.save(&state, &_guard) {
+                logging::log(
+                    "[Accounts]",
+                    &format!("❌ Trae 旧模型 ID 迁移落库失败（下次启动会重试）: {error}"),
+                );
+                return 0;
+            }
+        }
+        changed
+    }
+
     /// 记录账号**今天已签到**（登录页那枚按钮据此置灰）。
     ///
     /// `at` 是这次签到成功的毫秒时间戳。判定「今天签过没」由**读侧**按自然日比
@@ -590,9 +678,9 @@ impl AccountStore {
         // 排在 Cline 之后只是让「拆家类迁移」聚在一起。
         let workbuddy_moved = Self::migrate_workbuddy_intl_accounts(&mut state);
 
-        // ⑥ Qoder 国际版拆家（见 `migrate_qoder_intl_accounts`）：与 ⑤ 同款，
-        // 只改 `provider`、不改 id（Qoder 的 id 本来就带地区段）。
-        let qoder_moved = Self::migrate_qoder_intl_accounts(&mut state);
+        // ⑥ Qoder 地区归位：兼容旧记录，并恢复有明确国内版证据的错分账号。
+        // 只改 provider，不改作为请求历史引用键的账号 id。
+        let qoder_moved = super::qoder_accounts::migrate_accounts(&mut state.accounts);
 
         // ⑦ OfficeAce 账号名自愈（存量记录的 name 曾是十六进制 id，显示名躺在
         // refreshToken 的 claims 里）已随实现搬到插件：插件在登录时就把名字取全，
@@ -615,6 +703,8 @@ impl AccountStore {
             );
         }
 
+        let codearts_limiters = super::codearts_accounts::migrate_limiters(&mut state.accounts);
+
         if provider_added == 0
             && assignments.is_empty()
             && !scope_migrated
@@ -622,6 +712,7 @@ impl AccountStore {
             && workbuddy_moved == 0
             && qoder_moved == 0
             && chatglm_healed == 0
+            && codearts_limiters == 0
         {
             return json!({
                 "providerAdded": 0,
@@ -641,6 +732,9 @@ impl AccountStore {
                 "priorityChanged": false,
                 "assignments": [],
             });
+        }
+        if codearts_limiters > 0 {
+            logging::log("[Accounts]", &format!("已移除 {codearts_limiters} 个 CodeArts 账号的过期活动 Token 限制；无其他规则时改用总积分保护"));
         }
         if cline_renamed > 0 {
             logging::log(
@@ -663,7 +757,7 @@ impl AccountStore {
             logging::log(
                 "[Accounts]",
                 &format!(
-                    "🔀 Qoder 已拆为中国版 / 国际版两家，{qoder_moved} 个国际版账号已归位\
+                    "🔀 Qoder 已按地区归位 {qoder_moved} 个账号\
                      （凭证、优先级、限流记录与账号 id 均未改动）"
                 ),
             );
@@ -736,6 +830,64 @@ impl AccountStore {
                     "[Accounts]",
                     &format!(
                         "⚠️  历史账号凭证加密未完成（下次启动会自动重试，本次账号照常可用）: {error}"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// 把「插件落库但顶层缺身份字段」的账号补齐（幂等，可重复调用）。
+    ///
+    /// ── 它补的是什么（issue #380）──────────────────────────────
+    /// 插件登录 / 插件落库写的是 `pluginSecret` + `pluginPublic`，顶层没有
+    /// `uid` / `edition` / `endpoint` 等字段。而网关的计费、签到、余额几条
+    /// 读路径只认顶层 —— 那批账号「对话正常、签到全报找不到账号记录」。
+    ///
+    /// 写侧（`plugin_identity::mirror_identity`）已经在新写入时镜像了，本函数
+    /// 只收尾**升级前已经在库里**的那批。读侧也做了回落（`StoredAccount::uid`
+    /// 等），所以即使这一步没跑成，功能也是好的 —— 它只是把字段真正落到盘上，
+    /// 让导出的 JSON 与其它按顶层字段工作的地方也一致。
+    ///
+    /// ── 幂等与失败语义 ──────────────────────────────────────────
+    /// 判据是数据自证：只有「顶层缺、子对象里有」时才写，没有 kv 标记。
+    /// 一次读一次写（`migrate_startup` 同款）；没有要补的记录时不写库。
+    pub fn backfill_plugin_identity(&self) {
+        let guard = self.guard();
+        let mut state = self.load_locked(&guard);
+        let mut changed = 0usize;
+        for record in state.accounts.iter_mut() {
+            // 只处理插件落库形态（有 pluginSecret 或 pluginPublic）：内置记录
+            // 的顶层字段本来就是权威，不该被子对象覆盖。
+            let has_plugin_side = record.get("pluginSecret").is_some_and(|value| !value.is_null())
+                || record.get("pluginPublic").is_some_and(|value| !value.is_null());
+            if !has_plugin_side {
+                continue;
+            }
+            let before = record.to_value();
+            let provider = record.provider();
+            super::plugin_identity::mirror_identity(record, &provider);
+            if record.to_value() != before {
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            return;
+        }
+        match self.save_locked(&state, &guard) {
+            Ok(()) => {
+                drop(guard);
+                logging::log(
+                    "[Accounts]",
+                    &format!("🔧 已为 {changed} 个插件账号补齐顶层身份字段（uid / edition 等）"),
+                );
+            }
+            Err(error) => {
+                drop(guard);
+                logging::log(
+                    "[Accounts]",
+                    &format!(
+                        "⚠️  插件账号身份字段回填未完成（下次启动会自动重试，本次账号照常可用）: {}",
+                        error.message
                     ),
                 );
             }
@@ -826,7 +978,7 @@ impl AccountStore {
         const LEGACY_WORKBUDDY_ID: &str = "workbuddy";
         let mut moved = 0usize;
         for record in state.accounts.iter_mut() {
-            if record.provider() != LEGACY_WORKBUDDY_ID {
+            if record.provider() != LEGACY_WORKBUDDY_ID || record.has_plugin_secret() {
                 continue;
             }
             let region = crate::server::core::providers::workbuddy::Region::from_edition_id(
@@ -837,46 +989,6 @@ impl AccountStore {
                 continue;
             }
             record.set_provider(provider);
-            moved += 1;
-        }
-        moved
-    }
-
-    /// Qoder 国际版拆家：把 `provider == "qoder"` 且地区为国际版的记录归到
-    /// `qoder-intl`（2026-10，见 `providers::qoder::endpoints` 的模块头）。
-    ///
-    /// ── 判据：记录里的地区，而不是 id 前缀 ─────────────────────
-    /// 拆家前「这个账号属于哪个地区」由记录的 `mode`（兜底 `edition`）字段
-    /// 表达（`Region::from_payload` 的读取口径）。id 虽然也带地区段
-    /// （`qoder-global-…` / `qoder-cn-…`），但那是生成时的快照，记录的权威
-    /// 表达一直是凭证字段 —— 与 WorkBuddy 拆家「判据是 edition」同一取舍。
-    ///
-    /// ── 为什么不改 id（与 `migrate_cline_accounts` 的差别）────────
-    /// Qoder 的 id 生成时已含地区段，两地区的 id 空间天然不相交（同 WorkBuddy
-    /// 拆家的论证）；而 id 是 `requests.account_id` 与请求报表的引用键，改名
-    /// 会让历史记录对不上账号。
-    ///
-    /// ── 幂等 ────────────────────────────────────────────────────
-    /// 判据是数据本身（`provider == qoder && 地区 == 国际`）：迁完就没有
-    /// 这样的记录，再跑一遍返回 0、不写库。
-    fn migrate_qoder_intl_accounts(state: &mut AccountState) -> usize {
-        /// 拆家前的唯一 Qoder provider id（只出现在这里）
-        const LEGACY_QODER_ID: &str = "qoder";
-        let mut moved = 0usize;
-        for record in state.accounts.iter_mut() {
-            if record.provider() != LEGACY_QODER_ID {
-                continue;
-            }
-            let Some(region) =
-                crate::server::core::providers::qoder::endpoints::Region::from_payload(
-                    &record.to_value(),
-                )
-                .ok()
-                .filter(|region| *region == crate::server::core::providers::qoder::endpoints::Region::Global)
-            else {
-                continue;
-            };
-            record.set_provider(region.provider_id());
             moved += 1;
         }
         moved
@@ -1011,5 +1123,49 @@ impl AccountStore {
                 None
             }
         }
+    }
+}
+
+/// 递归改写 `limiterGroups` / `limiters` 里所有 `models` 数组，并去重。
+fn rewrite_models_arrays(value: &mut Value, mapping: &HashMap<String, String>) -> bool {
+    match value {
+        Value::Object(object) => {
+            let mut changed = false;
+            for (key, child) in object.iter_mut() {
+                if key == "models" {
+                    if let Some(items) = child.as_array_mut() {
+                        for item in items.iter_mut() {
+                            if let Some(text) = item.as_str() {
+                                if let Some(base) =
+                                    mapping.get(&text.trim().to_ascii_lowercase())
+                                {
+                                    *item = Value::String(base.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                        let before = items.len();
+                        let mut seen = HashSet::new();
+                        items.retain(|item| {
+                            item.as_str()
+                                .map(|text| seen.insert(text.to_ascii_lowercase()))
+                                .unwrap_or(true)
+                        });
+                        changed |= items.len() != before;
+                    }
+                } else if rewrite_models_arrays(child, mapping) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= rewrite_models_arrays(item, mapping);
+            }
+            changed
+        }
+        _ => false,
     }
 }

@@ -90,11 +90,13 @@
 //!   antigravity_accounts.rs Antigravity 账号（单一 provider）：粘贴 Google
 //!                refresh token 添加、刷新回写（比较-再写）、公开形态（只给尾号）
 
+pub(crate) mod account_identity;
 pub mod accio_accounts;
 pub mod antigravity_accounts;
 pub mod autoclaw_accounts;
 pub mod catpaw_accounts;
 pub mod chatglm_accounts;
+pub(crate) mod checkin_state;
 pub mod cline_accounts;
 pub mod codearts_accounts;
 pub mod atomcode_accounts;
@@ -109,11 +111,15 @@ pub mod monkeycode_accounts;
 pub mod officeace_accounts;
 pub mod orcaterm_accounts;
 pub mod plugin_accounts;
+mod plugin_identity;
 mod plugin_public;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
+mod read_rows;
+mod read_state;
 pub mod sql;
+mod snapshot;
 pub mod state;
 pub mod store;
 pub mod store_admin;

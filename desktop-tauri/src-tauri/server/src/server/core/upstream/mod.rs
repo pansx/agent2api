@@ -49,13 +49,21 @@ pub mod aggregate;
 pub mod cancellation;
 pub mod connections;
 pub mod continuation;
+mod image_tasks;
 mod images;
+pub mod image_compress;
+mod multipart;
+mod native_tools;
+mod http_dns;
+mod network_fallback;
 pub mod refusal;
 pub mod request;
 mod payload;
 mod provider_loop;
 mod rotate;
 mod route_state;
+mod route_context;
+mod conversation_ids;
 mod route_sticky;
 pub mod sse;
 pub mod stall;
@@ -201,8 +209,8 @@ pub struct ForwardRequest {
     pub telemetry: Arc<usage::RequestTelemetry>,
     /// 本次请求命中的网关 Key 所带来的**可用提供商**限制（R9）。
     ///
-    /// `None` = 不限制（免鉴权模式 / 环境变量 Key / 未知 Key，见
-    /// `core::key_scope` 的模块头）。为什么**放在入参里**而不是让转发层自己去
+    /// `None` = 已鉴权且没有白名单限制（环境变量 Key，见 `core::key_scope`）。
+    /// 为什么**放在入参里**而不是让转发层自己去
     /// 请求头里再解析一次：转发层不该认识「网关 Key」这个概念（它只认识上游与
     /// 账号），而且 handler 手里已经有 `KeyScope`（中间件放进请求扩展的那份），
     /// 再解析一次就是两处实现同一件事。传值（`Option<KeyScope>`）而不是引用：
@@ -317,9 +325,7 @@ impl UpstreamService {
     }
 
     pub fn route_sticky_sessions(&self, model: Option<&str>, now: i64) -> Vec<Value> {
-        self.route.sticky_list(model, now, crate::server::core::routing::sticky_ttl_ms(
-            crate::server::config::routing_settings().sticky,
-        ))
+        self.route.sticky_list(model, now)
     }
 
     pub fn clear_route_sticky(&self, id: Option<&str>, model: Option<&str>) -> usize {
@@ -360,6 +366,9 @@ impl UpstreamService {
     }
 
     async fn forward_request(&self, request: ForwardRequest, images: Option<crate::server::core::providers::images::ImageOperation>, preserve_system_prompt: bool) -> Result<ForwardOutcome, GatewayError> {
+        if let Some(rule) = super::update::required_update() {
+            return Err(GatewayError::with_status(426, rule["message"].as_str().unwrap_or("当前版本需要强制更新")).with_code("update_required"));
+        }
         // ── 调试模式：为本次请求装一个原始报文采集器 ─────────────────
         // 装在这里（转发入口）而不是各家适配器里：四条路径（流式 / 非流式 ×
         // 无状态 / 有状态）都要采，装一次全都覆盖到。开关关着时**不创建**
@@ -381,6 +390,11 @@ impl UpstreamService {
         if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
             return Err(cancellation::cancelled_error());
         }
+        let route_model = request.body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+        let route_store = self.store.clone();
+        let routing = crate::server::core::blocking::run(move || {
+            route_context::RequestRouting::capture(&route_model, &route_store)
+        }).await?;
         let mut slot = self.begin_slot(&request.dedupe_key, cancel.as_ref()).await;
         // 账号级活跃连接计数：**本请求**的凭证，随选路改绑到实际使用的账号。
         // 建在这里（而不是选路处）是因为它必须活到响应体发完 —— 流式路径由
@@ -419,6 +433,8 @@ impl UpstreamService {
         let sanitize = config.sanitize_settings();
         let developer_role_compat = config.developer_role_compat();
         let prompt = config.prompt_plan();
+        // 图片压缩设置是 `Copy`，拷一份随上下文带下去（不借用 config，省去生命周期约束）
+        let image_compress = *config.image_compress_settings();
         // Key 的提供商白名单随请求带进转发上下文：它要活过整条转发链
         //（含流式 —— 但流本身不需要它，只在选路与重试时读）。
         // 这里把 request 的字段**移出来**再借给 context：`request` 的其它部分
@@ -432,12 +448,14 @@ impl UpstreamService {
         let proxy_override = request.proxy_override;
         let context = payload::ProviderContext {
             body: &upstream_body,
+            routing,
             stream: request.stream,
             images,
             client_headers: &request.client_headers,
             telemetry: &request.telemetry,
             sanitize,
             developer_role_compat,
+            image_compress,
             prompt,
             preserve_system_prompt,
             key_scope: key_scope.as_ref(),

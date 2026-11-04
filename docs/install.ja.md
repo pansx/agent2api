@@ -151,7 +151,7 @@ Linux では `/etc/agent2api/agent2api.env` に、Windows ではサービスの�
 
 ## Docker
 
-イメージタグ：`latest` は最新の正式版、`beta` は最新の beta プレリリースを追従します。`3.3.0-beta.3` のような完全なバージョン番号で固定することもできます。beta を使うには、以下のコマンドまたは Compose 設定の `aimodcc/agent2api:latest` を `aimodcc/agent2api:beta` に変更し、更新時は `docker compose pull && docker compose up -d` を実行してください。beta の公開で `latest` は変更されず、手動の開発ビルドは `dev` のみ更新します。
+イメージタグ：`latest` は最新の正式版、`beta` は最新の beta プレリリースを追従します。`3.3.0-beta.3` のような完全なバージョン番号で固定することもできます。beta を使うには、以下のコマンドまたは Compose 設定の `aimodcc/agent2api:latest` を `aimodcc/agent2api:beta` に変更し、更新時は `docker compose pull && docker compose up -d` を実行してください。beta の公開で `latest` は変更されず、手動の開発ビルドは `dev` のみ更新します。同じイメージは GitHub Container Registry にも公開しています。イメージ名を `ghcr.io/aimod-cc/agent2api` に置き換えてください（タグ規則は同じです）。
 
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
@@ -185,9 +185,30 @@ services:
 | `AGENT2API_ALLOW_NO_KEY` | `1` で fail-closed を無効化（キー未設定でも `/v1` を許可。純粋な内部ネットワーク限定） |
 | `AGENT2API_CAPTCHA_ENABLED` | ログインページの人間確認ウィジェット: 既定 `1`（有効）、`0` で無効 |
 | `AGENT2API_SELF_UPDATE` | コンテナ内の更新入口: 既定 `1`（有効。パネルから「ダウンロードして更新」可能）。`0` で無効化し手動更新のみに |
+| `AGENT2API_IMAGE_CACHE_MB` | 生成画像のダウンロード用メモリキャッシュ上限（MiB、既定 `128`、範囲 8〜4096）。不正 / 範囲外は既定値にフォールバック |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | セッション画像の圧縮結果メモリキャッシュ上限（MiB、既定 `128`、範囲 8〜4096、扱いは同じ） |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 上級: 「更新確認 / 更新ダウンロード」を自前のソースに差し替えます。前者はリポジトリを変更（既定は上流の `aimod-cc/Agent2API`。fork 後は変更可）、後者は API ルートを変更（既定 `https://api.github.com`。GitHub と同じ形の release JSON を返す必要があります）。自前ソース設定後、ダウンロードの許可リストは**そのソース自身のホスト**のみを追加で許可します（スキームはソースに従う: `http://` を設定すれば平文ダウンロードも許可。ローカル演習 / 内部ミラー向け） |
 
 ソースからビルドする場合: 本リポジトリをクローンして `docker compose up -d --build`（イメージにはゲートウェイとパネルのみが入り、Rust ツールチェーンは含まれません）。
+
+### メモリ使用量
+
+イメージ内のゲートウェイ（Linux ターゲット）には jemalloc アロケーターを組み込んでいます。長時間の稼働やマルチアカウントの並行転送では、システム標準のアロケーターよりメモリ断片化が起きにくく、RSS がじわじわ増えにくくなります —— 小メモリのマシンが最もよく押し潰されたり OOM になったりする箇所です。
+
+小メモリのマシンでは、コンテナにメモリ上限を設定することをおすすめします。超過するとカーネルがプロセスを終了し、`restart: unless-stopped` が起動し直します。「1 回再起動する」形になり、ホスト（や同居する他サービス）を巻き込みません。
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+compose の場合はサービスに `mem_limit: 1g` を 1 行追加します（`docker-compose.yml` にコメント例があります）。swarm や `docker compose --compatibility` では `deploy.resources.limits.memory` を使います。1g はあくまで出発点で、実際の並行数に合わせて調整してください。
+
+常駐メモリを使う 2 つの画像キャッシュ上限は、どちらも環境変数で小さくできます（既定は各 `128` MiB）: `AGENT2API_IMAGE_CACHE_MB`（生成画像のダウンロードキャッシュ）、`AGENT2API_IMAGE_COMPRESS_CACHE_MB`（セッション画像の圧縮結果キャッシュ）。不正 / 範囲外の値は既定値にフォールバックし、起動を妨げることはありません。
+
+`MALLOC_ARENA_MAX=2` のような glibc アロケーターの調整は、**jemalloc を組み込んでいない形態**（旧イメージ、自前ビルドのサーバー、デスクトップ）にのみ意味があります。本イメージでは設定不要です。
 
 **Web パネルでの機能差**（「本機デスクトップクライアントが無い」ことに起因）: Web ログイン（WorkBuddy / Qoder / Cline）、SMS 認証コード、認証情報の貼り付けは完全に利用できます。本機へのコールバックが必要な Web ログイン（AutoClaw / CatPaw / Accio / CodeArts / Trae）と「本機ログイン状態の取り込み」は利用できないため、認証情報の貼り付けをお使いください。デスクトップ版で「Web 管理パネルも公開する」を有効にしてブラウザーから開いた場合も同じ差になります —— 同一の画面、同一の判定です。
 
@@ -323,7 +344,7 @@ Release の `Agent2API-<バージョン>.ipa` は**既定で未署名**です �
 | ワンタップチェックイン、チェックイン履歴の閲覧 | 新規特典とプランの個別受け取り |
 | モデルの有効化/無効化、プロバイダー別の絞り込み | モデルマッピング、推論レベル、ケイパビリティフラグの編集 |
 | ゲートウェイキーのコピー、キーの有効化/無効化 | キーの新規作成、プロバイダー/モデルの許可リスト設定 |
-| プロキシの有効化/無効化、接続テスト | プロキシの追加、サブスクリプション管理、カーネルのダウンロード |
+| 手動 HTTP / SOCKS5 プロキシの追加・編集・削除、Clash Verge エンドポイントの同期、有効化/無効化、接続テスト | —（プロキシのサブスクリプションと内蔵カーネルは提供終了） |
 | スケジュールタスクの有効化/無効化、間隔の変更 | ポート、ルーティング、リトライ、タイムアウト、データ保持の変更 |
 | アシスタントのクイック照会（残高 / 重複モデル / 本日の使用量 / レート制限中のアカウント） | アシスタントの自由対話とツール呼び出し |
 | Agent テイクオーバーの状態確認、復元 | クライアント設定の書き換え（スマートフォンからはローカルファイルを読めません） |

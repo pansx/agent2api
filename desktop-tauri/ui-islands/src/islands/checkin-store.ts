@@ -22,7 +22,9 @@ import type {
   TravelState,
 } from './checkin-types'
 import { t } from '../i18n'
+import { DEFAULT_PAGE_SIZE, SERVER_PAGE_SIZES, readPageSize } from './table-shell'
 import type { CheckinResultRow } from '../../../ui-shared/checkin'
+import { growthTaskRunnable } from '../../../ui-shared/checkin'
 import { rowCompleted, rowPending, rowMessage as resultMessage } from '../../../ui-shared/checkin-result'
 import { onboardingFromCenter } from './checkin-onboarding-cache'
 
@@ -92,7 +94,7 @@ type CheckinBridge = {
   runCheckinSchedule?: (id: string) => Promise<CheckinRunResult | null | undefined>
   saveAutoCheckin?: (patch: Record<string, unknown>) => Promise<AutoState | null | undefined>
   getCheckinKeepalive?: () => Promise<KeepaliveState | null | undefined>
-  saveCheckinKeepalive?: (models: string[]) => Promise<KeepaliveState | null | undefined>
+  saveCheckinKeepalive?: (models: string[], apiKeyId?: string | null) => Promise<KeepaliveState | null | undefined>
   getTravelSchedule?: () => Promise<TravelState | null | undefined>
   saveTravelSchedule?: (patch: Record<string, unknown>) => Promise<TravelState | null | undefined>
   runTravelScheduleNow?: () => Promise<TravelRunResult | null | undefined>
@@ -227,6 +229,8 @@ export type Store = {
     limit: number
     offset: number
     outcome: string
+    /** 签到类型：'' = 全部，manual / schedule / makeup */
+    kind: string
     provider: string
     keyword: string
     /** 时间下界（毫秒；undefined = 不限） */
@@ -237,6 +241,8 @@ export type Store = {
   /** 成长任务的缓存：账号 id → 缓存 */
   growth: Map<string, GrowthCache>
 }
+
+const recordsPageSize = readPageSize('checkin-records', SERVER_PAGE_SIZES)
 
 export const store: Store = {
   center: null,
@@ -255,7 +261,10 @@ export const store: Store = {
   recordsLoaded: false,
   recordsError: '',
   recordsLoading: false,
-  recordsQuery: { limit: 50, offset: 0, outcome: '', provider: '', keyword: '' },
+  recordsQuery: {
+    limit: typeof recordsPageSize === 'number' ? recordsPageSize : DEFAULT_PAGE_SIZE,
+    offset: 0, outcome: '', kind: '', provider: '', keyword: '',
+  },
   onboarding: new Map(),
   growth: new Map(),
 }
@@ -277,10 +286,14 @@ export function patch(next: Partial<Store>): void {
 
 /* ─── 读 ───────────────────────────────────── */
 
+let centerRequest = 0
+
 /** 拉聚合快照（页面打开 / 任何写动作之后） */
 export async function loadCenter(): Promise<void> {
+  const request = ++centerRequest
   try {
     const data = await bridge().getCheckinCenter?.()
+    if (request !== centerRequest) return
     if (!data) {
       patch({ loaded: true, loadError: '后端未返回签到中心数据' })
       return
@@ -295,33 +308,45 @@ export async function loadCenter(): Promise<void> {
       travelTimesDraft: null,
     })
   } catch (error) {
-    patch({ loaded: true, loadError: errorMessage(error) })
+    if (request === centerRequest) patch({ loaded: true, loadError: errorMessage(error) })
   }
 }
 
-/** 拉签到记录（分页 + 筛选） */
+let recordsRequest = 0
+
+/** 拉签到记录（分页 + 筛选）。 */
 export async function loadRecords(): Promise<void> {
+  const request = ++recordsRequest
+  const query = store.recordsQuery
   patch({ recordsLoading: true })
   try {
-    const query = store.recordsQuery
     const data = await bridge().getCheckinRecords?.({
       limit: query.limit,
       offset: query.offset,
       outcome: query.outcome || undefined,
+      kind: query.kind || undefined,
       provider: query.provider || undefined,
       keyword: query.keyword || undefined,
       start: query.start,
     })
+    if (request !== recordsRequest) return
+    const total = Math.max(0, Number(data?.total) || 0)
+    const lastOffset = Math.max(0, (Math.ceil(total / query.limit) - 1) * query.limit)
+    if (query.offset > lastOffset) {
+      patch({ recordsQuery: { ...query, offset: lastOffset } })
+      await loadRecords()
+      return
+    }
     patch({
       records: Array.isArray(data?.records) ? data.records : [],
-      recordsTotal: Number(data?.total) || 0,
+      recordsTotal: total,
       recordsLoaded: true,
       recordsError: '',
     })
   } catch (error) {
-    patch({ recordsLoaded: true, recordsError: errorMessage(error) })
+    if (request === recordsRequest) patch({ recordsLoaded: true, recordsError: errorMessage(error) })
   } finally {
-    patch({ recordsLoading: false })
+    if (request === recordsRequest) patch({ recordsLoading: false })
   }
 }
 
@@ -441,20 +466,21 @@ export async function toggleMaster(enabled: boolean): Promise<void> {
 export async function saveScheduleEntry(
   payload: Record<string, unknown>,
   options: { closeEditor?: boolean; silent?: boolean } = {},
-): Promise<void> {
-  await run(
+): Promise<boolean> {
+  const saved = await run(
     async () => {
       const data = await bridge().saveCheckinSchedule?.(payload)
-      if (data) {
-        patch({
-          center: withAuto(store.center, data),
-          ...(options.closeEditor === false ? {} : { editingId: null }),
-        })
-      }
+      if (!data) throw new Error(t('后端未返回定时签到数据'))
+      patch({
+        center: withAuto(store.center, data),
+        ...(options.closeEditor === false ? {} : { editingId: null }),
+      })
+      return true
     },
     { success: options.silent ? undefined : '✅ 已保存', reload: false, failure: '保存失败' },
   )
-  void loadCenter()
+  if (saved) void loadCenter()
+  return saved === true
 }
 
 /** 删除一条定时条目 */
@@ -483,10 +509,10 @@ export async function runScheduleEntry(id: string): Promise<void> {
 }
 
 /** 保活模型链 */
-export async function saveKeepaliveModels(models: string[]): Promise<void> {
+export async function saveKeepaliveModels(models: string[], apiKeyId?: string | null): Promise<void> {
   await run(
     async () => {
-      const data = await bridge().saveCheckinKeepalive?.(models)
+      const data = await bridge().saveCheckinKeepalive?.(models, apiKeyId)
       if (data && store.center) {
         patch({ center: { ...store.center, keepalive: data }, keepaliveDraft: null })
       }
@@ -541,6 +567,7 @@ export async function clearRecords(all: boolean): Promise<void> {
         ? { all: '1' }
         : {
           outcome: query.outcome || undefined,
+          kind: query.kind || undefined,
           provider: query.provider || undefined,
           keyword: query.keyword || undefined,
         })
@@ -631,13 +658,7 @@ export async function queryGrowth(id: string): Promise<void> {
 export async function runGrowth(id: string, mode: 'full' | 'claim'): Promise<void> {
   const current = growthOf(id)
   if (current.running) return
-  const targets = current.tasks.filter(task => {
-    if (!task.supported || task.unforgeable || task.locked) return false
-    if (mode === 'claim') {
-      return task.status === 'completed' || (task.current >= task.target && task.status !== 'claimed')
-    }
-    return task.status !== 'claimed'
-  })
+  const targets = current.tasks.filter(task => growthTaskRunnable(task, mode))
   if (targets.length === 0) {
     toast('没有需要执行的任务')
     return

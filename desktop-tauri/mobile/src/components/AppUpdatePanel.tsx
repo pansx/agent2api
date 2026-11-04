@@ -23,6 +23,7 @@ import { GithubAccessSettingsPanel } from './GithubAccessSettings'
 import { AppUpdateSettings } from './AppUpdateSettings'
 import { openExternal } from '../lib/community'
 import { t } from '../i18n'
+import { githubErrorMessage, assetMissingReason } from '../../../ui-shared/updates'
 import { Card, Button } from '@ui'
 import { Switch as UiSwitch } from '@ui'
 
@@ -155,7 +156,7 @@ export function AppUpdatePanel() {
       setPhase(prev => (prev === 'downloading' || prev === 'downloaded' ? prev : canUpdate ? 'available' : 'latest'))
     } catch (failure) {
       if (!silent && revision === channelRevision.current) {
-        setError(failure instanceof Error ? failure.message : String(failure))
+        setError(githubErrorMessage(failure, t, 'update'))
         setPhase('idle')
       }
     } finally {
@@ -167,7 +168,11 @@ export function AppUpdatePanel() {
   const download = async () => {
     const url = info?.asset?.url
     if (!url) {
-      setError(t('这一版没有提供 Android 安装包'))
+      // 手机端要的包固定是 `.apk`（后端按后缀挑，见 pick_android_apk）——
+      // 原因与桌面端同一处口径，只是「本机要什么」这一项换成 apk
+      setError(t('这一版没有提供 Android 安装包：{reason}', {
+        reason: assetMissingReason(info?.assetProbe, { fallbackSuffix: '.apk' }, t),
+      }))
       return
     }
     setBusy(true)
@@ -178,7 +183,7 @@ export function AppUpdatePanel() {
       await downloadApk(url, setProgress)
       setPhase('downloaded')
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure))
+      setError(githubErrorMessage(failure, t, 'update'))
       setPhase('available')
     } finally {
       setBusy(false)
@@ -199,7 +204,7 @@ export function AppUpdatePanel() {
       await installApk()
       store.toast(t('已启动安装器'))
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure))
+      setError(githubErrorMessage(failure, t, 'update'))
     } finally {
       setBusy(false)
     }
@@ -240,6 +245,7 @@ export function AppUpdatePanel() {
   return (
     <div className='m-section'>
       <SectionHead title={t('软件更新')} />
+      {info?.forceUpdate?.required ? <div className='mb-2 text-sm text-warning'>{t('需要强制更新')} · {info.forceUpdate.message}</div> : null}
       <Card className='m-card'>
         <div className='m-row' style={{ alignItems: 'flex-start' }}>
           <span className='m-logo' style={{ background: 'var(--m-primary-soft)', borderColor: 'transparent', color: 'var(--m-primary)' }}>

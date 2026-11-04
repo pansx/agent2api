@@ -180,6 +180,10 @@ pub fn count() -> usize {
 
 /// 落一条完整报文；同 id 覆盖，失败只打日志，不影响转发。
 pub fn record(entry: TrafficEntry) {
+    super::blocking::in_place(|| record_sync(entry));
+}
+
+fn record_sync(entry: TrafficEntry) {
     let Some(db) = db() else {
         // 库不可用：静默丢弃（与改造前「STORE 未初始化」同一处理）。
         // 这里连日志都不打 —— 每个请求都会走到这一步，刷屏反而掩盖真问题。
@@ -209,17 +213,6 @@ pub fn record(entry: TrafficEntry) {
 /// 与改造前「内存里从尾部往前找第一个匹配」逐字一致。
 pub fn get(id: &str) -> Option<TrafficEntry> {
     db()?.with(|conn| sql::select_one(conn, id)).and_then(Result::ok).flatten()
-}
-
-/// 清空（设置页 / 请求日志「清空」时一并调用）
-pub fn clear() {
-    let Some(db) = db() else {
-        return;
-    };
-    // 失败只打控制台（理由同 `record`）
-    if let Some(Err(error)) = db.with(|conn| sql::delete_all(conn)) {
-        eprintln!("[Debug] 调试报文清空失败: {error}");
-    }
 }
 
 /// 一条原始报文记录。

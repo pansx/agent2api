@@ -151,7 +151,7 @@ No Linux coloque-as em `/etc/agent2api/agent2api.env`; no Windows edite a chave 
 
 ## Docker
 
-Tags da imagem: `latest` acompanha a versão estável mais recente, enquanto `beta` acompanha a pré-versão beta mais recente. Use uma versão completa, como `3.3.0-beta.3`, para fixá-la. Para usar beta, troque `aimodcc/agent2api:latest` por `aimodcc/agent2api:beta` no comando ou na configuração do Compose abaixo; atualize com `docker compose pull && docker compose up -d`. Versões beta não alteram `latest`, e builds manuais de desenvolvimento atualizam apenas `dev`.
+Tags da imagem: `latest` acompanha a versão estável mais recente, enquanto `beta` acompanha a pré-versão beta mais recente. Use uma versão completa, como `3.3.0-beta.3`, para fixá-la. Para usar beta, troque `aimodcc/agent2api:latest` por `aimodcc/agent2api:beta` no comando ou na configuração do Compose abaixo; atualize com `docker compose pull && docker compose up -d`. Versões beta não alteram `latest`, e builds manuais de desenvolvimento atualizam apenas `dev`. A mesma imagem também é publicada no GitHub Container Registry: troque o nome da imagem por `ghcr.io/aimod-cc/agent2api` (as regras de tag são idênticas).
 
 ```bash
 docker run -d --name agent2api --restart unless-stopped \
@@ -185,9 +185,30 @@ Variáveis de ambiente (todas opcionais):
 | `AGENT2API_ALLOW_NO_KEY` | `1` desativa o fail-closed (serve `/v1` mesmo sem chave configurada — só para redes internas) |
 | `AGENT2API_CAPTCHA_ENABLED` | Widget de verificação humana na tela de login: `1` ativado (padrão), `0` desativado |
 | `AGENT2API_SELF_UPDATE` | Ponto de atualização dentro do contêiner: `1` ativado por padrão (o painel oferece "Baixar e atualizar"); `0` desativa e deixa apenas a atualização manual |
+| `AGENT2API_IMAGE_CACHE_MB` | Limite do cache em memória de download das imagens geradas (MiB, padrão `128`, faixa 8–4096). Valores inválidos ou fora da faixa voltam ao padrão |
+| `AGENT2API_IMAGE_COMPRESS_CACHE_MB` | Limite do cache em memória do resultado da compactação de imagens de sessão (MiB, padrão `128`, faixa 8–4096, mesmas regras) |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | Avançado: aponte "verificar atualizações / baixar atualizações" para a sua própria fonte. O primeiro troca o repositório (por padrão segue o upstream `aimod-cc/Agent2API`; em fork, sobrescreva), o segundo troca a raiz da API (padrão `https://api.github.com`; deve devolver um JSON de release no formato do GitHub). Com uma fonte própria configurada, a lista de permissões de download passa a aceitar, além disso, apenas **o próprio host dessa fonte** (o esquema segue a fonte: uma fonte `http://` também permite download em texto puro — só para ensaios locais / espelhos internos) |
 
 Compilar a partir do código: clone o repositório e rode `docker compose up -d --build` (a imagem contém apenas o gateway e o painel, sem toolchain Rust).
+
+### Uso de memória
+
+O gateway da imagem (alvos Linux) já vem com o alocador jemalloc embutido. Em execuções longas e com vários encaminhamentos de contas em paralelo ele fragmenta bem menos que o alocador do sistema, e o RSS deixa de subir aos poucos — que é justamente onde máquinas com pouca memória costumam travar ou ser mortas por OOM.
+
+Em máquinas com pouca memória, vale limitar a memória do contêiner: ao ultrapassar, o kernel mata o processo e o `restart: unless-stopped` o levanta de novo — o resultado é "um reinício" em vez de derrubar o host (ou outros serviços na mesma máquina).
+
+```bash
+# docker run
+docker run -d --name agent2api --restart unless-stopped --memory=1g \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+No compose, adicione `mem_limit: 1g` ao serviço (há um exemplo comentado no `docker-compose.yml`); em swarm ou `docker compose --compatibility`, use `deploy.resources.limits.memory`. Encare o 1g como ponto de partida e ajuste à sua concorrência.
+
+Os dois caches de imagem mantidos em memória podem ser reduzidos por variável de ambiente (128 MiB cada por padrão): `AGENT2API_IMAGE_CACHE_MB` (cache de download das imagens geradas) e `AGENT2API_IMAGE_COMPRESS_CACHE_MB` (cache do resultado da compactação de imagens de sessão). Valores inválidos ou fora da faixa voltam ao padrão e nunca impedem a inicialização.
+
+Ajustes de alocador glibc como `MALLOC_ARENA_MAX=2` só fazem sentido em builds **sem** jemalloc (imagens antigas, servidor compilado por você, desktop); esta imagem não precisa disso.
 
 **Diferenças de recursos no painel web** (decorrem de "não haver cliente de desktop local"): login pela web (WorkBuddy / Qoder / Cline), código por SMS e credenciais coladas funcionam plenamente; logins pela web que exigem callback nesta máquina (AutoClaw / CatPaw / Accio / CodeArts / Trae) e a "importação do estado de login local" não estão disponíveis — use credenciais coladas. Com o desktop e a opção de expor o painel ativadas, abrir no navegador mostra as mesmas diferenças: uma interface, um conjunto de regras.
 
@@ -323,7 +344,7 @@ Quando há uma nova versão, uma barra "Reiniciar e atualizar" surge na parte de
 | Check-in com um toque, ver histórico de check-in | Resgatar recompensas de integração e planos individualmente |
 | Ativar/desativar modelos, filtrar por provedor | Editar mapeamentos de modelo, níveis de raciocínio, flags de capacidade |
 | Copiar gateway keys, ativar/desativar keys | Criar keys, definir listas de provedores/modelos permitidos |
-| Ativar/desativar proxies, testar conectividade | Adicionar proxies, gerenciar assinaturas, baixar o kernel |
+| Adicionar, editar e excluir proxies HTTP / SOCKS5 manuais; sincronizar endpoints do Clash Verge; ativar/desativar e testar conectividade | — (assinaturas de proxy e o kernel integrado foram descontinuados) |
 | Ativar/desativar tarefas agendadas, alterar intervalos | Alterar porta, roteamento, retry, timeouts, retenção de dados |
 | Consultas rápidas do assistente (saldos / modelos duplicados / uso de hoje / contas limitadas) | Conversa livre e chamada de ferramentas do assistente |
 | Ver status do takeover de Agent, restaurar | Reescrever configurações de clientes (um celular não lê arquivos locais) |

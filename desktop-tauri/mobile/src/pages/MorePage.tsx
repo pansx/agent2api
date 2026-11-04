@@ -71,9 +71,9 @@ export function MorePage() {
               <div style={{ padding: '0 20px 4px', fontSize: 11.5, fontWeight: 600, color: 'var(--m-text-3)', letterSpacing: '.02em' }}>
                 {group.title}
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4, padding: '4px 10px 10px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 4, padding: '4px 10px 10px' }}>
                 {group.entries.map(entry => (
-                  <Button size='default' variant='ghost'
+                  <Button size='default' variant='ghost' className='h-auto min-w-0 whitespace-normal'
                     key={entry.id}
                     type='button'
                     onClick={() => store.push(entry.id)}
@@ -92,6 +92,7 @@ export function MorePage() {
                     }}
                   >
                     <span
+                      className='shrink-0'
                       style={{
                         width: 44,
                         height: 44,
@@ -186,7 +187,7 @@ export function MorePage() {
 
       <div className='m-section' style={{ paddingBottom: 8 }}>
         <Card className='m-card m-card-pad' style={{ fontSize: 11.5, color: 'var(--m-text-3)', lineHeight: 1.7 }}>
-          {t('手机端可管理所连接网关的账号、签到与插件；添加账号、编辑凭证、改写客户端配置仍需桌面端。')}
+          {t('手机端可管理所连接网关的账号、签到与插件，并使用提供商声明的动态登录入口；其余既有添加入口、编辑凭证和改写客户端配置仍需桌面面板。')}
         </Card>
       </div>
     </div>

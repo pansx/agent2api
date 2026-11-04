@@ -178,9 +178,12 @@ pub async fn get_routing_queue(
 }
 
 pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
+    let accounts = routing::accounts_of(&state.store().list_visible_accounts());
+    queue_for_accounts(state, model, &accounts)
+}
+
+pub(crate) fn queue_for_accounts(state: &ServerState, model: Option<String>, accounts: &[Value]) -> Value {
     let snapshot = config::current();
-    let accounts_value = state.store().list_visible_accounts();
-    let accounts = routing::accounts_of(&accounts_value);
     // 候选收窄：点名了模型 → 只留「清单里有它的家」（与转发同一张家清单，
     // `route_for_forward`）；没点名 → 全部账号。与 session.rs 的 ★ 推算同一取材。
     let providers: Vec<String> = match &model {
@@ -191,7 +194,7 @@ pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
         Some(_) => accounts.iter()
             .filter(|account| providers.contains(&routing::provider_of(account).to_string()))
             .cloned().collect(),
-        None => accounts.clone(),
+        None => accounts.to_vec(),
     };
     let scoped = crate::server::core::routing_scope::apply_accounts(
         &scoped, model.as_deref().unwrap_or(""),
@@ -219,7 +222,7 @@ pub(crate) fn queue_json(state: &ServerState, model: Option<String>) -> Value {
         ))
         .filter_map(|account| routing::account_id(account).map(str::to_string))
         .collect();
-    let settings = config::routing_settings();
+    let settings = config::routing_settings_for_model(model.as_deref().unwrap_or(""));
     // 面板只**看**当前状态，不做粘性查找、不前进轮转游标 —— 预演不该刷新
     // 任何会话的计时，也不该消耗下一次轮转。家内轮询的各家游标同理，所以
     // 两种轮转策略都传 `None`：面板看到的是「各家都从第 0 位起」的静态序。
