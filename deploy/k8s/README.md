@@ -6,7 +6,7 @@
 | 项 | 值 |
 | --- | --- |
 | 命名空间 | `agent2api` |
-| 镜像 | `crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.4.1` |
+| 镜像 | `crpi-uj5w1t4aai9wiimi.cn-hangzhou.personal.cr.aliyuncs.com/pansx1/agent2api:3.4.2` |
 | 端口 | Service 3065 → NodePort 30665 |
 | 数据卷 | `agent2api-data`（2Gi，挂 `/data`） |
 | 调度节点 | `pansx-ubuntu`（局部卷绑节点） |
@@ -75,7 +75,7 @@ Pod 必须能出网访问 `raw.githubusercontent.com` 与 `api.github.com`（本
 
 每日签到 / 新手福利 / 活动套餐各张卡有没有账号，取决于插件申报的
 `CheckinInfo`（`daily` / `onboarding` / `plans` / `growth`）——网关不判断
-「这家能不能签」，只按申报分派。3.4.1 这版插件下本集群落在每日签到范围内的
+「这家能不能签」，只按申报分派。当前这版插件下本集群落在每日签到范围内的
 是 37 个账号；装了什么插件、申报了什么，这张表就跟着变。
 
 ## 3.4 起：模型调用必须带网关 Key
